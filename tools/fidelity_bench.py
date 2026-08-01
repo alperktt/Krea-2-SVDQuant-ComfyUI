@@ -85,12 +85,24 @@ LORA_STRENGTH = 1.0
 # which is the point: a second LoRA is what separates "this LoRA behaves like that" from
 # "LoRAs behave like that". A txtfusion-only adapter would be useless here -- it never
 # touches the 224 quantized blocks, so it cannot exercise the branch at all.
+#
+# The names must match what ComfyUI puts in the node's dropdown, which for a LoRA in a
+# subfolder is a *native* relative path -- `Krea2\canon_krea2.safetensors` on Windows. A
+# forward slash there fails validation with "value_not_in_list", so the subfolder is joined
+# rather than written in. `LORA_SUBDIR = ""` for a flat `models/loras`.
+LORA_SUBDIR = "Krea2"
+
+
+def _lora(name: str) -> str:
+    return os.path.join(LORA_SUBDIR, name) if LORA_SUBDIR else name
+
+
 ARM_LORA = {
     "base": None,
-    "lora": "canon_krea2.safetensors",                      # rank 16, photographic style
-    "lora2": "bloomgirls-ultrarealism-krea2_4k.safetensors", # rank 32, realism style
-    "lora3": "lenovo_krea2.safetensors",                    # rank 16
-    "lora4": "nicegirls_krea2.safetensors",                 # rank 16
+    "lora": _lora("canon_krea2.safetensors"),                      # rank 16, photographic style
+    "lora2": _lora("bloomgirls-ultrarealism-krea2_4k.safetensors"), # rank 32, realism style
+    "lora3": _lora("lenovo_krea2.safetensors"),                    # rank 16
+    "lora4": _lora("nicegirls_krea2.safetensors"),                 # rank 16
 }
 
 # Loader choice is a property of the file, so it lives with the file rather than being
@@ -99,7 +111,7 @@ ARM_LORA = {
 # which re-quantizes the LoRA delta to 4 bits, so quantized files go through this repo's node.
 CHECKPOINTS_TURBO = {
     "bf16":      {"file": "turbo.safetensors",                            "loader": "unet", "quantized": False},
-    "nolowrank": {"file": "Krea2-Turbo-W4A4-convrot.safetensors",         "loader": "unet", "quantized": True},
+    "nolowrank": {"file": "Krea2-Turbo-W4A4-noLowRank.safetensors",       "loader": "unet", "quantized": True},
     "r16":       {"file": "Krea2-Turbo-SVDQuant-W4A4-rank16.safetensors", "loader": "svdq", "quantized": True},
     "r64":       {"file": "Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors", "loader": "svdq", "quantized": True},
     "r128":      {"file": "Krea2-Turbo-SVDQuant-W4A4-rank128.safetensors","loader": "svdq", "quantized": True},
@@ -107,6 +119,11 @@ CHECKPOINTS_TURBO = {
     # Same rank, same size, same kernel -- built with --act-stats so the low-rank split is
     # weighted by measured activation RMS instead of plain weight magnitude.
     "r256aa":    {"file": "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", "loader": "svdq", "quantized": True},
+    # Same build as r256aa except the activation statistics were captured with `lora2`
+    # loaded. BENCHMARKS.md's open question is whether act-aware goes null under a LoRA
+    # because the calibration saw no adapter; this arm is what answers it, and it is only
+    # meaningful when scored on the `lora2` arm it was calibrated for.
+    "r256aal2":  {"file": "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware-lora2.safetensors", "loader": "svdq", "quantized": True},
 }
 
 CHECKPOINTS_BASE = {
