@@ -588,11 +588,98 @@ def report_profile(patcher, tokens: int) -> list[str]:
     return lines
 
 
+def report_compile(patcher, tokens: int) -> list[str]:
+    """How many graph breaks a compiled step pays, and why.
+
+    `torch.compile` is the largest single speed lever left on this model -- a profiled step
+    is only 37% GEMM against 34% small elementwise/norm/RoPE kernels, and that 34% is exactly
+    what inductor fuses. But it can only fuse *within* a graph, and today every quantized
+    Linear is a deliberate break (`svdquant_w4a4._shield_from_dynamo`), so the model compiles
+    as ~225 fragments instead of one.
+
+    Rather than compile the whole diffusion model -- which needs a real timestep/context
+    signature and takes a minute -- this traces one representative layer wrapped in the kind
+    of elementwise work that surrounds it in a block. That is enough to answer the only
+    question that matters: does control leave the graph at the kernel call? The whole-model
+    figure is that count times the number of quantized layers, which is printed alongside so
+    the number in a bug report is the model's, not one layer's.
+    """
+    lines = ["== compile (tokens={}) ==".format(tokens)]
+    if not torch.cuda.is_available():
+        lines.append("CUDA not available; nothing to trace")
+        return lines
+
+    try:
+        from torch._dynamo import explain, reset as dynamo_reset
+    except Exception as exc:  # pragma: no cover - depends on the torch build
+        lines.append("torch._dynamo unavailable: {}: {}".format(type(exc).__name__, exc))
+        return lines
+
+    mm.load_models_gpu([patcher], force_full_load=True)
+    device = mm.get_torch_device()
+    shapes = _distinct_shapes(patcher.model.diffusion_model)
+    if not shapes:
+        lines.append("no convrot_w4a4 layers found")
+        return lines
+
+    layers = sum(1 for _ in quantized_linears(patcher.model.diffusion_model))
+    lines.append("{:<44} {:>8} {:>8} {:>14}".format(
+        "layer [in -> out]", "graphs", "breaks", "breaks/model"))
+
+    reasons: list[str] = []
+    for shape, (name, module) in sorted(shapes.items()):
+        in_features = int(shape[1])
+        dtype = module.weight._params.orig_dtype
+        if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            dtype = torch.bfloat16
+        x = torch.randn((tokens, in_features), dtype=dtype, device=device)
+
+        # Scale/add either side so there is real fusable work for inductor to lose. A bare
+        # `module(x)` would report the same break count while proving nothing about what the
+        # break costs.
+        def traced(t, _m=module):
+            return torch.nn.functional.silu(_m(t * 1.0001)) + 1.0
+
+        try:
+            dynamo_reset()
+            result = explain(traced)(x)
+            graphs, breaks = result.graph_count, result.graph_break_count
+            for entry in getattr(result, "break_reasons", [])[:1]:
+                text = str(getattr(entry, "reason", entry)).replace("\n", " ")[:110]
+                if text not in reasons:
+                    reasons.append(text)
+        except Exception as exc:
+            logging.warning("[krea2-svdquant] dynamo explain failed on %s: %s", name, exc,
+                            exc_info=True)
+            lines.append("{:<44} {:>8} {:>8} {:>14}".format(
+                "{} [{}]".format(name, in_features)[:44], "-", "-",
+                "{}: {}".format(type(exc).__name__, exc)[:14]))
+            del x
+            continue
+        finally:
+            dynamo_reset()
+
+        lines.append("{:<44} {:>8} {:>8} {:>14}".format(
+            "{} [{} -> {}]".format(name, in_features, int(shape[0]))[:44],
+            graphs, breaks, breaks * layers))
+        del x
+        mm.soft_empty_cache()
+
+    lines.append("")
+    lines.append("{} quantized layers in this model. 0 breaks per layer means a compiled "
+                 "step is one graph and inductor can fuse across the whole block; anything "
+                 "above 0 multiplies by the layer count.".format(layers))
+    for reason in reasons:
+        lines.append("  break reason: {}".format(reason))
+    return lines
+
+
 REPORTS = {
     "env": report_env,
     "dispatch": report_dispatch,
     "bench": report_bench,
     "profile": report_profile,
+    "compile": report_compile,
 }
 
 
@@ -608,11 +695,12 @@ class Krea2SVDQuantDiagnostics:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "Output of the Krea2 SVDQuant W4A4 Loader."}),
-                "mode": (["dispatch", "env", "bench", "profile"], {
+                "mode": (["dispatch", "env", "bench", "profile", "compile"], {
                     "tooltip": "dispatch: which kernel actually runs (start here). "
                                "env: versions and memory accounting. "
                                "bench: quantized vs bf16 per layer. "
-                               "profile: torch.profiler table.",
+                               "profile: torch.profiler table. "
+                               "compile: graph breaks a TorchCompileModel run would pay.",
                 }),
                 "tokens": ("INT", {
                     "default": _DEFAULT_TOKENS, "min": 64, "max": 65536, "step": 64,

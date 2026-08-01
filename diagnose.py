@@ -49,8 +49,8 @@ def main() -> int:
                         help="path to a --format svdq checkpoint (or a name under "
                              "models/diffusion_models)")
     parser.add_argument("--mode", default="dispatch",
-                        choices=["dispatch", "env", "bench", "profile", "all"],
-                        help="'all' runs env, dispatch, bench and profile in that order")
+                        choices=["dispatch", "env", "bench", "profile", "compile", "all"],
+                        help="'all' runs every report in REPORTS order")
     parser.add_argument("--tokens", type=int, default=None,
                         help="sequence length to probe with; 4096 = 1024x1024")
     parser.add_argument("--no-load", action="store_true",
