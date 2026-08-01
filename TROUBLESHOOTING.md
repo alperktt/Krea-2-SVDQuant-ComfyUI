@@ -37,6 +37,57 @@ python -c "import torch; print(torch.__version__, torch.version.cuda)"
 If that prints anything below `13.0`, install a cu130+ torch build. The loader now prints
 the resolved backend on every load and shouts if it isn't `cuda`.
 
+## "It's no faster than my INT8 model"
+
+This one is mostly **expected**, and the README used to invite the disappointment by
+publishing a "2.9x vs BF16" column with no INT8 row next to it. Measured per sampling step on
+a 3090 at 1024x1024, in one ComfyUI session (`tools/speed_bench.py`):
+
+| checkpoint | s/step | + `TorchCompileModel` |
+|---|---|---|
+| INT8 + convrot | 0.993 | 0.886 |
+| SVDQuant rank 256, actaware | 0.845 | 0.718 |
+| W4A4, no low-rank branch | 0.678 | crashes, see below |
+
+1.18x over INT8, 1.23x if both are compiled. At 8 steps that is 5.9 s against 7.3 s — a real
+difference, and a small enough one that "I didn't notice any" is a fair report rather than a
+misconfiguration. **The decisive win over INT8 is VRAM**: 8.50 GiB resident against 12.84 GiB.
+
+Before concluding it is only that, check the two things that *are* misconfigurations:
+
+1. `python diagnose.py --no-load` — if the backend is not `cuda`, read the section above;
+   that costs far more than the INT8 gap.
+2. If you are on `rank 256`, the low-rank branch is ~25% of a step (0.845 against 0.678).
+   `Krea2-Turbo-W4A4-noLowRank` is the fastest checkpoint here by a wide margin if you can
+   accept the fidelity cost — see BENCHMARKS.md for what that cost is.
+
+## "TorchCompileModel crashes on the w4a4 / int8 checkpoint"
+
+Known limitation, and it is specifically the checkpoints **without** a low-rank branch — the
+ones that load through the stock `UNETLoader` rather than this pack's loader. The error is:
+
+```
+torch._dynamo.exc.TorchRuntimeError: RuntimeError when making fake tensor call
+  ... Cannot access data pointer of Tensor (e.g. FakeTensor ...). If you're using
+  torch.compile/export/fx, it is likely that we are erroneously tracing into a custom
+  kernel. To fix this, please wrap the custom kernel into an opaque custom op.
+```
+
+Dynamo reaches the `comfy_kitchen` kernel with fake tensors and it wants real pointers. The
+SVDQuant loader in this pack avoids it by registering that call as an opaque custom op
+(`krea2::w4a4_linear`), which is why `--format svdq` checkpoints compile and these do not.
+Doing the same for a stock-loaded model needs a hook this pack does not currently have — the
+same gap as the sage-attention guard further down this page.
+
+Workarounds: use a `--format svdq` checkpoint (rank 16 costs ~0.4 GB over noLowRank), or drop
+the TorchCompileModel node. Uncompiled, the branchless checkpoint is still the fastest option
+in the table above.
+
+If the custom op itself ever misbehaves — a `comfy_kitchen` update that moves the layout API
+is the plausible way — the loader falls back to the old graph-break path on its own and says
+so in its status output. `KREA2_W4A4_OP=0` in the environment forces that fallback, which is
+also how the two rows in BENCHMARKS.md's compile table were measured against each other.
+
 ## "No speedup at all on my RTX 20-series" (Turing)
 
 Different problem, and this one has no fix on our side. The backend resolves to `cuda`, the

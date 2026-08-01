@@ -202,6 +202,7 @@ Installing this adds seven nodes, all under **Krea2/SVDQuant**:
 | `svdquant_diag.py` | The **Diagnostics** and **Env Check** nodes |
 | `diagnose.py` | The same reports from a terminal, without starting ComfyUI (`--mode all` for everything) |
 | `tools/fidelity_bench.py` | Paired multi-seed multi-LoRA LPIPS harness. Every fidelity claim in this repo comes from it |
+| `tools/speed_bench.py` | Per-step speed, by timing each checkpoint at two step counts and taking the slope. Every s/step number in this repo comes from it |
 | `tools/contact_sheet.py` | Builds the contact sheets in [GALLERY.md](GALLERY.md) — for looking at, not scoring |
 | `tools/pixel_metrics.py` | The shared LPIPS/PSNR/SSIM implementation `fidelity_bench` imports. Not a CLI |
 | `tools/build_workflows.py` | Regenerates `workflows/*.json`, both dialects. Edit this, not the JSON |
@@ -328,10 +329,35 @@ Full tables, methodology and caveats: **[BENCHMARKS.md](BENCHMARKS.md)**. Images
 | SVDQuant rank 256 | 7.77 s | 2.42x |
 
 `-actaware` is absent from that table because it cannot differ: same tensor shapes, same
-format, same kernels, only different numbers inside the branch. The branch costs ~9-10% of step
-time and barely varies with rank — rank 256 is only ~4% slower than rank 16, so rank is a size
-and fidelity decision, not a speed one. FP8 is *slower* than
-BF16 on Ampere (no FP8 tensor cores); INT8 is the fastest accurate option.
+format, same kernels, only different numbers inside the branch. FP8 is *slower* than BF16 on
+Ampere (no FP8 tensor cores).
+
+**How much faster than INT8?** The question everyone actually asks, and the table above does
+not answer it — it has no INT8 row. Here it is, measured per *sampling step* rather than per
+image, so CLIP text-encode and VAE decode (several seconds, identical across checkpoints)
+stop hiding the difference. `tools/speed_bench.py`, one ComfyUI session, three timed runs at
+8 and at 24 steps, per-step cost taken as the slope between them:
+
+| checkpoint | s/step | with `TorchCompileModel` |
+|---|---|---|
+| INT8 + convrot ([int8-fast](https://github.com/BobJohnson24/ComfyUI-INT8-Fast)) | 0.993 | 0.886 |
+| SVDQuant rank 256, actaware | 0.845 | **0.718** |
+| W4A4, no low-rank branch | **0.678** | *crashes, see TROUBLESHOOTING.md* |
+
+So **1.18x over INT8 uncompiled, 1.23x with both compiled** — not the 2-3x the "vs BF16"
+column suggests, and small enough at 8 steps (5.9 s against 7.3 s) that people report seeing
+no difference at all. The honest summary: W4A4's decisive win over INT8 is **VRAM** (8.50 GiB
+resident against 12.84 GiB, as ComfyUI reports them on load), and the speed win is real but
+modest.
+
+Two corrections to earlier claims, both from this measurement:
+
+* **The low-rank branch costs ~25% of a step at rank 256**, not 9-10% (0.845 against
+  noLowRank's 0.678). The 9-10% figure came from rank 64 and does not carry to rank 256.
+  Rank is still primarily a size and fidelity decision, but it is not free.
+* Numbers taken in different ComfyUI sessions drift by up to ~5% on this machine (INT8
+  measured 0.948 in one session and 0.993 in another). Only compare rows measured in the
+  same run; `tools/speed_bench.py` does one arm matrix per invocation for that reason.
 
 **Fidelity**, LPIPS against a BF16 reference over 16 prompts x 2 seeds (lower is closer):
 

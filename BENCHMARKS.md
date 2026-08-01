@@ -231,10 +231,32 @@ checkpoint reaches in this benchmark.
 Under a LoRA the gain shrinks to roughly nothing: three of the four LoRA arms are positive and
 one (`canon`) is slightly negative at t=1.67 — inside the noise, and the only arm of the five
 pointing that way. **Four of five agree, so this is not evidence of an act-aware/LoRA
-incompatibility**, and nothing here says avoid it with a LoRA. The plausible mechanism for the
-shrinkage is calibration mismatch: the statistics were captured with no LoRA loaded, so they
-describe activation energy the adapter then shifts. Recalibrating with the adapter loaded is
-untested, and is the obvious next experiment for anyone picking this up.
+incompatibility**, and nothing here says avoid it with a LoRA.
+
+The plausible mechanism for the shrinkage was calibration mismatch — statistics captured with
+no LoRA loaded describe activation energy the adapter then shifts. **That has now been tested,
+and it is not the explanation.**
+
+A second rank-256 checkpoint was built from the same BF16 source with the same settings, the
+only difference being that its `--act-stats` file was captured with `bloomgirls` loaded (8
+calibration prompts, disjoint from the 16 scored here, 264k tokens per layer). Scored on the
+`lora2` arm it was calibrated for, against a BF16+LoRA reference, 16 prompts x 2 seeds:
+
+| checkpoint | LPIPS | PSNR | SSIM |
+|---|---|---|---|
+| rank 256 | 0.3322 | 15.94 | 0.6849 |
+| rank 256, act-aware (no LoRA during capture) | **0.3123** | **16.54** | **0.6968** |
+| rank 256, act-aware (LoRA loaded during capture) | 0.3204 | 16.15 | 0.6931 |
+
+| comparison | mean | se | t | wins |
+|---|---|---|---|---|
+| act-aware vs LoRA-calibrated act-aware | -0.0080 | 0.0159 | **-0.51** | 18/32 |
+| plain rank 256 vs LoRA-calibrated | +0.0118 | 0.0198 | 0.60 | 14/32 |
+
+Calibrating with the adapter loaded is, if anything, marginally *worse*, and every difference
+is far under the arm's reseed floor of 0.5447. So the LoRA shrinkage is not a calibration
+mismatch; what causes it is still open. Worth stating plainly because this was written up here
+as the obvious next experiment, and it did not pay.
 
 `r256-actaware` also beats `r64` in every arm (t = 3.44 / 2.69 / 3.49 / 3.06 / 1.89), so
 nothing here reverses the Test 3 recommendation either.
@@ -282,10 +304,29 @@ X seconds`" is CLIP load/encode + model staging + sampling + VAE decode + save c
 
 Rank does not measurably change warm speed — CLIP text-encode (Qwen3-VL 4B) and VAE
 decode overhead dominate a single 1024x1024/8-step/batch-1 image and mask the low-rank
-branch's cost. Add a **TorchCompileModel** node (backend `inductor`) after the loader
-for a further ~20-25% cut on the sampling portion specifically (see profiling below);
-that number does not show up in the table above since it isn't included in this
-upload's default workflow.
+branch's cost.
+
+**That masking is why this table should not be used to compare formats**, and it is how the
+row above ended up reading "INT8 10.4 s against W4A4 10.1 s" — a 3% gap that is almost
+entirely fixed cost. `tools/speed_bench.py` measures the sampling loop on its own, by timing
+each arm at two step counts and taking the slope, so everything that does not scale with
+steps cancels. Same 3090, one session, three timed runs per cell:
+
+| checkpoint | s/step | + `TorchCompileModel` |
+|---|---|---|
+| INT8 + convrot (`int8-fast`, per-row) | 0.993 | 0.886 |
+| **W4A4 + SVDQuant low-rank, rank 256 actaware** | 0.845 | **0.718** |
+| **W4A4 + convrot, no low-rank branch** | **0.678** | crashes (TROUBLESHOOTING.md) |
+
+Read against those numbers: W4A4 is **1.18x** faster than INT8 per step, **1.23x** with both
+compiled, and the **low-rank branch is ~25% of a step at rank 256** (0.845 against 0.678) —
+not the 9-10% quoted elsewhere, which was measured at rank 64. TorchCompileModel is worth
+1.10x on the svdq checkpoint and 1.12x on INT8; the "~20-25%" figure below predates the
+per-step harness and describes the sampling portion of an end-to-end run.
+
+Sessions drift: INT8 measured 0.948 s/step in one ComfyUI process and 0.993 in another, so
+only rows from a single run are comparable. Each `speed_bench.py` invocation runs its whole
+arm matrix in one process for that reason.
 
 **FP8 is not faster than BF16 on Ampere** — there are no FP8 tensor cores on this
 architecture, so ComfyUI casts to bf16 and calls cuBLAS. It's included here because it's
@@ -355,8 +396,29 @@ the numbers rank, the sheets adjudicate.
 | W4A4 activation quantization | 8% |
 
 A third of a step is small elementwise kernels, which is why `torch.compile` (backend
-`inductor`) helps: add a **TorchCompileModel** node after the loader. Stock ComfyUI
-quantized tensors normally break `torch.compile` (Dynamo can't trace into the
-`comfy_kitchen` kernel); the W4A4 loader here works around that by marking those calls as
-graph breaks so inductor still fuses everything around them. First run after loading pays
-~50s of compilation; subsequent runs are warm.
+`inductor`) helps: add a **TorchCompileModel** node after the loader. First run after loading
+pays ~50s of compilation; subsequent runs are warm.
+
+Getting inductor to see that third of the step took two goes. Dynamo cannot trace
+`F.linear(x, QuantizedTensor)` at all — it reaches the `comfy_kitchen` kernel with fake
+tensors, which have no data pointer. The first workaround marked every quantized Linear as a
+deliberate graph break, which compiled but cost **two breaks per layer, 448 across the 224
+blocks** (`diagnose.py --mode compile`): inductor never saw two consecutive layers in one
+graph, and cudagraphs was off entirely. The loader now registers the kernel call as an opaque
+custom op instead (`krea2::w4a4_linear`), which is what PyTorch's own error message asks for,
+and a compiled step becomes **one graph, zero breaks**. Measured against `KREA2_W4A4_OP=0`,
+which forces the old path:
+
+| | graph breaks | s/step eager | s/step compiled |
+|---|---|---|---|
+| graph-break workaround | 448 | 0.846 | 0.730 |
+| opaque custom op | **0** | **0.833** | **0.696** |
+
+The eager gain is not the op — an eager call skips it — but the memoized backend resolution
+that came with it: `convrot_w4a4_linear` re-resolves its backend on every call, revalidating
+seven constraints 1792 times per image, with no caching anywhere in kitchen's registry.
+
+Fidelity is unchanged, and checking that needed a noise floor: the kernel is not
+run-to-run deterministic. Two renders of the same seed through the *same* path in two
+processes differ by max 32/255 (mean 0.143); op-on against op-off differ by **less** than
+that (max 28, mean 0.108). The difference is inside the floor.
