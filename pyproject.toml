@@ -1,0 +1,21 @@
+[project]
+name = "krea-2-svdquant"
+description = "Native INT8/W4A4 quantization and an SVDQuant-style low-rank branch for Krea 2 on ComfyUI, tuned for Ampere GPUs."
+version = "1.0.0"
+license = { file = "LICENSE.md" }
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Operating System :: OS Independent",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+[project.urls]
+Repository = "https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI"
+Documentation = "https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI#readme"
+"Bug Tracker" = "https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI/issues"
+
+[tool.comfy]
+PublisherId = "alperktt"
+DisplayName = "Krea 2 SVDQuant"
+includes = []
