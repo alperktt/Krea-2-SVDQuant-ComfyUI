@@ -1,7 +1,7 @@
 [project]
 name = "krea-2-svdquant"
-description = "Native INT8/W4A4 quantization and an SVDQuant-style low-rank branch for Krea 2 on ComfyUI, tuned for Ampere GPUs."
-version = "1.0.0"
+description = "Krea 2, 2.42x faster than BF16 on an RTX 3090 (up to 2.90x), at a third the size. Native INT8/W4A4 quantization with an SVDQuant low-rank branch, no calibration dataset needed. Turbo and base."
+version = "1.0.1"
 license = { file = "LICENSE.md" }
 requires-python = ">=3.10"
 dependencies = []
