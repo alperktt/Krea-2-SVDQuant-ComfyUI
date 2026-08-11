@@ -1,7 +1,7 @@
 [project]
 name = "krea-2-svdquant"
 description = "Krea 2, 2.42x faster than BF16 on an RTX 3090 (up to 2.90x), at a third the size. Native INT8/W4A4 quantization with an SVDQuant low-rank branch, no calibration dataset needed. Turbo and base."
-version = "1.0.1"
+version = "1.0.2"
 license = { file = "LICENSE.md" }
 requires-python = ">=3.10"
 dependencies = []
@@ -18,4 +18,5 @@ Documentation = "https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI#readme"
 [tool.comfy]
 PublisherId = "alperktt"
 DisplayName = "Krea 2 SVDQuant"
+Icon = "https://raw.githubusercontent.com/alperktt/Krea-2-SVDQuant-ComfyUI/master/assets/icon.png"
 includes = []
