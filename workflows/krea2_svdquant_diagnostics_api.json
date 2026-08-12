@@ -1,0 +1,68 @@
+{
+  "1": {
+    "class_type": "Krea2SVDQuantEnvCheck",
+    "inputs": {},
+    "_meta": {
+      "title": "1. Env Check - no model needed, run this first"
+    }
+  },
+  "2": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "1",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Env Check report"
+    }
+  },
+  "3": {
+    "class_type": "Krea2SVDQuantW4A4Loader",
+    "inputs": {
+      "model_name": "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors"
+    },
+    "_meta": {
+      "title": "2. Load the checkpoint you are diagnosing"
+    }
+  },
+  "4": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "3",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "Loader status - names the kernel that will run"
+    }
+  },
+  "5": {
+    "class_type": "Krea2SVDQuantDiagnostics",
+    "inputs": {
+      "mode": "dispatch",
+      "tokens": 4096,
+      "model": [
+        "3",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "3. Diagnostics - start with mode=dispatch"
+    }
+  },
+  "6": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "5",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "Diagnostics report - paste this into an issue"
+    }
+  }
+}

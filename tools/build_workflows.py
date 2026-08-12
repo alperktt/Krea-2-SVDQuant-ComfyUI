@@ -37,7 +37,12 @@ ROW = 200          # vertical gap between rows
 TEAL = ("#233", "#355")        # loaders
 GREEN = ("#232", "#353")       # prompts
 PURPLE = ("#323", "#535")      # sampling
-YELLOW = ("#432", "#653")      # notes / read me first
+YELLOW = ("#432", "#653")      # notes / read me first / diagnostics
+ORANGE = ("#653", "#874")      # LoRA
+
+# Mirrors svdquant_lora.ADAPTER_BYPASS. Not imported: this script must run without ComfyUI
+# on sys.path, and the loader module imports comfy at module level. Asserted in main().
+ADAPTER_BYPASS = "bypass (exact, slower)"
 
 
 class Graph:
@@ -56,7 +61,7 @@ class Graph:
         self._api = {}     # node_id -> what the API dialect needs about that node
 
     def add(self, class_type, col, row, inputs=None, outputs=None, widgets=None,
-            title=None, colour=None, size=None, api=True):
+            title=None, colour=None, size=None, api=True, mode=0):
         """`widgets` is a list of (input_name, value).
 
         The name is what the API dialect needs and the UI dialect ignores; `None` marks a
@@ -66,7 +71,13 @@ class Graph:
 
         `api=False` drops the node from the API output: Notes and the optional Diagnostics
         node are editor furniture with nothing to execute.
+
+        `mode=4` mutes the node in the editor. A muted node must also be `api=False` -- the
+        API dialect has no mute flag, so leaving it in would execute something the editor
+        shows as off.
         """
+        if mode == 4 and api:
+            raise ValueError("a muted node must be api=False: {}".format(class_type))
         nid = self._next_node
         self._next_node += 1
         inputs = inputs or []
@@ -83,7 +94,7 @@ class Graph:
             "size": size or [380, 100],
             "flags": {},
             "order": self._next_node - 2,
-            "mode": 0,
+            "mode": mode,
             "inputs": [{"name": n, "type": t, "link": None} for n, t in inputs],
             "outputs": [{"name": n, "type": t, "links": [], "slot_index": i}
                         for i, (n, t) in enumerate(outputs)],
@@ -221,6 +232,68 @@ checkpoint, then reselect it in the loader.
    Same slow-generation checklist too: read the loader's status
    output first."""
 
+LORA_NOTE = """KREA 2 TURBO + LoRA - SVDQuant W4A4
+
+Same graph as the plain Turbo one, with LoRA loaders inserted between
+the checkpoint loader and the sampler.
+
+1. USE THIS NODE, NOT THE STOCK ONE. On a quantized checkpoint the
+   stock LoraLoaderModelOnly has to dequantize the 4-bit weight, add
+   the LoRA, and requantize it -- which throws away the format and
+   quantizes the LoRA delta to 4 bits along with it. This node
+   attaches the LoRA as a parallel branch instead:
+   (W + BA)x == Wx + B(Ax), so the quantized weight is never touched.
+
+2. CHECK THE CONSOLE. The node prints what it matched, e.g.
+     224 quantized layers, 32 normal layers
+   If it says 0 quantized layers, the LoRA does not target this model
+   and nothing will change. That line is the first thing to look at
+   when a LoRA "does nothing".
+
+3. STACKING. Chain more of these nodes, one per LoRA. The whole stack
+   is refolded each time, so strengths stay exact no matter how many
+   you chain, and the cost stays one pair of GEMMs. The second loader
+   here is bypassed (ctrl-B) -- unmute it to use it.
+
+4. RANK MATTERS HERE. Without a LoRA, branch ranks 64/128/256 measure
+   the same. With one, rank 256 wins clearly and rank 64 loses most of
+   its advantage. If you use LoRAs, download rank 256.
+
+5. adapters INPUT. Only affects LoKr / LoHa / OFT, which cannot fold
+   into the branch. "bypass" is exact and costs ~1.8s per model call
+   at 1440x1920; "bake" is free per-step but requantizes the delta.
+   A plain up/down LoRA ignores this setting entirely."""
+
+DIAG_NOTE = """KREA 2 SVDQUANT - DIAGNOSTICS
+
+Run this before reporting a bug, and before downloading 8 GB.
+Nothing here generates an image.
+
+ENV CHECK (left, no model needed)
+   Answers the single most common report: "the quantized checkpoint
+   is slower than fp8". Almost always the cause is that ComfyUI
+   disabled comfy_kitchen's CUDA backend because torch was built
+   against CUDA < 13, and the fallback dequantizes int4 in Python --
+   slower than bf16, not faster. Needs no model, so run it first.
+
+DIAGNOSTICS (right, needs a checkpoint) - the mode widget:
+   dispatch  which kernel actually runs. START HERE.
+   env       versions + memory accounting, including where the
+             low-rank factors currently live. Under lowvram they
+             should read cpu between steps, not cuda.
+   bench     quantized vs bf16 timing per layer.
+   profile   torch.profiler table.
+   compile   graph breaks a TorchCompileModel run would pay.
+
+   tokens = sequence length. 4096 is 1024x1024. Kernel selection is
+   shape-dependent, so match your real resolution.
+
+WHAT TO PASTE INTO AN ISSUE
+   Your GPU, the checkpoint filename, and the report output of both
+   nodes. Both are OUTPUT_NODEs, so the text shows in the node itself
+   and in the console. Neither is cached -- they re-measure the live
+   process every run, which is the point."""
+
 PROMPT = ("A cluttered antique clockmaker's workshop seen through a cracked magnifying "
           "glass, brass gears laid out in a spiral on the workbench, a ginger cat asleep "
           "on a stack of leather-bound books, warm afternoon light with visible dust "
@@ -356,6 +429,148 @@ def build_base():
     return g.serialize(groups), g.serialize_api()
 
 
+def build_lora():
+    """The Turbo graph with two LoRA loaders spliced in, the second one muted.
+
+    Two rather than one because stacking is the question people actually ask, and a muted
+    second node shows the answer (chain them) without changing what the graph does on first
+    run.
+    """
+    g = Graph()
+    g.note(LORA_NOTE, 0, 0, size=(400, 720), title="READ ME FIRST")
+
+    loader = g.add("Krea2SVDQuantW4A4Loader", 1, 0,
+                   outputs=[("MODEL", "MODEL"), ("STRING", "STRING")],
+                   widgets=[("model_name", "Krea2-Turbo-SVDQuant-W4A4-rank256.safetensors")],
+                   title="Krea2 SVDQuant W4A4 Loader (rank 256 for LoRAs)", colour=TEAL,
+                   size=[400, 120])
+    clip = g.add("CLIPLoader", 1, 1, outputs=[("CLIP", "CLIP")],
+                 widgets=[("clip_name", "qwen3vl_4b_fp8_scaled.safetensors"), ("type", "krea2"),
+                          ("device", "default")],
+                 title="Text encoder (Qwen3-VL 4B)", colour=TEAL, size=[400, 120])
+    vae = g.add("VAELoader", 1, 2, outputs=[("VAE", "VAE")],
+                widgets=[("vae_name", "qwen_image_vae.safetensors")], title="VAE", colour=TEAL,
+                size=[400, 80])
+
+    lora1 = g.add("Krea2SVDQuantLoraLoader", 2, 0, inputs=[("model", "MODEL")],
+                  outputs=[("model", "MODEL")],
+                  widgets=[("lora_name", "your_krea2_lora.safetensors"), ("strength", 1.0),
+                           ("adapters", ADAPTER_BYPASS)],
+                  title="Krea2 SVDQuant LoRA Loader", colour=ORANGE, size=[400, 140])
+    lora2 = g.add("Krea2SVDQuantLoraLoader", 2, 1, inputs=[("model", "MODEL")],
+                  outputs=[("model", "MODEL")],
+                  widgets=[("lora_name", "your_krea2_lora.safetensors"), ("strength", 0.6),
+                           ("adapters", ADAPTER_BYPASS)],
+                  title="Second LoRA (muted - ctrl-B to enable)", colour=ORANGE,
+                  size=[400, 140], mode=4, api=False)
+
+    pos = g.add("CLIPTextEncode", 3, 0, inputs=[("clip", "CLIP")],
+                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[("text", PROMPT)],
+                title="Prompt (add your LoRA trigger words)", colour=GREEN, size=[400, 220])
+    neg = g.add("ConditioningZeroOut", 3, 1.4, inputs=[("conditioning", "CONDITIONING")],
+                outputs=[("CONDITIONING", "CONDITIONING")],
+                title="Negative (zeroed - required at cfg 1.0)", colour=GREEN, size=[400, 60])
+    latent = g.add("EmptySD3LatentImage", 3, 2.2, outputs=[("LATENT", "LATENT")],
+                   widgets=[("width", 1024), ("height", 1024), ("batch_size", 1)],
+                   title="Latent 1024x1024", colour=GREEN, size=[400, 120])
+
+    sampler = g.add("KSampler", 4, 0,
+                    inputs=[("model", "MODEL"), ("positive", "CONDITIONING"),
+                            ("negative", "CONDITIONING"), ("latent_image", "LATENT")],
+                    outputs=[("LATENT", "LATENT")],
+                    widgets=[("seed", 987654321), (None, "randomize"), ("steps", 8), ("cfg", 1.0),
+                             ("sampler_name", "euler"), ("scheduler", "simple"), ("denoise", 1.0)],
+                    title="KSampler - 8 steps, cfg 1.0", colour=PURPLE, size=[400, 280])
+    decode = g.add("VAEDecode", 5, 0, inputs=[("samples", "LATENT"), ("vae", "VAE")],
+                   outputs=[("IMAGE", "IMAGE")], title="VAE Decode", colour=PURPLE, size=[300, 60])
+    save = g.add("SaveImage", 5, 0.7, inputs=[("images", "IMAGE")],
+                 widgets=[("filename_prefix", "krea2_turbo_lora")], title="Save", colour=PURPLE,
+                 size=[400, 300])
+
+    g.link(loader, "MODEL", lora1, "model")
+    g.link(lora1, "model", lora2, "model")
+    g.link(lora1, "model", sampler, "model")
+    g.link(clip, "CLIP", pos, "clip")
+    g.link(pos, "CONDITIONING", neg, "conditioning")
+    g.link(pos, "CONDITIONING", sampler, "positive")
+    g.link(neg, "CONDITIONING", sampler, "negative")
+    g.link(latent, "LATENT", sampler, "latent_image")
+    g.link(sampler, "LATENT", decode, "samples")
+    g.link(vae, "VAE", decode, "vae")
+    g.link(decode, "IMAGE", save, "images")
+
+    groups = [
+        g.group("Load", (500, 20, 420, 620)),
+        g.group("LoRA - chain one node per LoRA", (940, 20, 420, 420), colour="#a85"),
+        g.group("Prompt", (1360, 20, 420, 620)),
+        g.group("Sample", (1780, 20, 420, 640), colour="#8a4"),
+    ]
+    return g.serialize(groups), g.serialize_api()
+
+
+def build_diagnostics():
+    """Env Check + Diagnostics. No sampler: nothing here generates an image."""
+    g = Graph()
+    g.note(DIAG_NOTE, 0, 0, size=(430, 700), title="READ ME FIRST")
+
+    env = g.add("Krea2SVDQuantEnvCheck", 1, 0, outputs=[("report", "STRING")],
+                title="1. Env Check - no model needed, run this first", colour=YELLOW,
+                size=[400, 80])
+    env_view = g.add("PreviewAny", 1, 0.6, inputs=[("source", "*")],
+                     title="Env Check report", colour=YELLOW, size=[400, 300])
+
+    loader = g.add("Krea2SVDQuantW4A4Loader", 2, 0,
+                   outputs=[("MODEL", "MODEL"), ("STRING", "STRING")],
+                   widgets=[("model_name", "Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors")],
+                   title="2. Load the checkpoint you are diagnosing", colour=TEAL,
+                   size=[400, 120])
+    loader_view = g.add("PreviewAny", 2, 0.7, inputs=[("source", "*")],
+                        title="Loader status - names the kernel that will run", colour=TEAL,
+                        size=[400, 200])
+
+    diag = g.add("Krea2SVDQuantDiagnostics", 3, 0, inputs=[("model", "MODEL")],
+                 outputs=[("model", "MODEL"), ("report", "STRING")],
+                 widgets=[("mode", "dispatch"), ("tokens", 4096)],
+                 title="3. Diagnostics - start with mode=dispatch", colour=YELLOW,
+                 size=[400, 130])
+    diag_view = g.add("PreviewAny", 3, 0.8, inputs=[("source", "*")],
+                      title="Diagnostics report - paste this into an issue", colour=YELLOW,
+                      size=[400, 400])
+
+    g.link(env, "report", env_view, "source")
+    g.link(loader, "STRING", loader_view, "source")
+    g.link(loader, "MODEL", diag, "model")
+    g.link(diag, "report", diag_view, "source")
+
+    groups = [
+        g.group("Step 1 - does the int4 kernel exist at all?", (500, 20, 420, 480),
+                colour="#a85"),
+        g.group("Step 2 - load it", (940, 20, 420, 480)),
+        g.group("Step 3 - what actually runs", (1360, 20, 420, 620), colour="#8a4"),
+    ]
+    return g.serialize(groups), g.serialize_api()
+
+
+def _check_adapter_constant():
+    """The `adapters` widget value must match svdquant_lora.ADAPTER_BYPASS exactly.
+
+    ComfyUI matches combo widgets by string. A drifted copy here would write a workflow whose
+    dropdown silently falls back to the first option, so read it out of the source rather than
+    trusting that two literals stayed equal.
+    """
+    src = os.path.join(os.path.dirname(HERE), "svdquant_lora.py")
+    with open(src, encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("ADAPTER_BYPASS"):
+                actual = line.split("=", 1)[1].strip().strip('"')
+                if actual != ADAPTER_BYPASS:
+                    raise SystemExit(
+                        "ADAPTER_BYPASS drifted: svdquant_lora.py has {!r}, this script has "
+                        "{!r}".format(actual, ADAPTER_BYPASS))
+                return
+    raise SystemExit("could not find ADAPTER_BYPASS in " + src)
+
+
 def _write(path, payload):
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(payload, fh, indent=2, ensure_ascii=False)
@@ -363,9 +578,12 @@ def _write(path, payload):
 
 
 def main():
+    _check_adapter_constant()
     os.makedirs(OUT_DIR, exist_ok=True)
     for name, build in (("krea2_turbo_svdquant_w4a4_t2i", build_turbo),
-                        ("krea2_base_svdquant_w4a4_t2i", build_base)):
+                        ("krea2_base_svdquant_w4a4_t2i", build_base),
+                        ("krea2_turbo_svdquant_w4a4_lora", build_lora),
+                        ("krea2_svdquant_diagnostics", build_diagnostics)):
         graph, api = build()
         ui_path = os.path.join(OUT_DIR, name + ".json")
         api_path = os.path.join(OUT_DIR, name + "_api.json")

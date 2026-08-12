@@ -1,0 +1,141 @@
+{
+  "1": {
+    "class_type": "Krea2SVDQuantW4A4Loader",
+    "inputs": {
+      "model_name": "Krea2-Turbo-SVDQuant-W4A4-rank256.safetensors"
+    },
+    "_meta": {
+      "title": "Krea2 SVDQuant W4A4 Loader (rank 256 for LoRAs)"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+      "type": "krea2",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "Text encoder (Qwen3-VL 4B)"
+    }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "_meta": {
+      "title": "VAE"
+    }
+  },
+  "4": {
+    "class_type": "Krea2SVDQuantLoraLoader",
+    "inputs": {
+      "lora_name": "your_krea2_lora.safetensors",
+      "strength": 1.0,
+      "adapters": "bypass (exact, slower)",
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Krea2 SVDQuant LoRA Loader"
+    }
+  },
+  "5": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "A cluttered antique clockmaker's workshop seen through a cracked magnifying glass, brass gears laid out in a spiral on the workbench, a ginger cat asleep on a stack of leather-bound books, warm afternoon light with visible dust motes, photorealistic, 85mm lens, shallow depth of field",
+      "clip": [
+        "2",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Prompt (add your LoRA trigger words)"
+    }
+  },
+  "6": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": {
+      "conditioning": [
+        "5",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Negative (zeroed - required at cfg 1.0)"
+    }
+  },
+  "7": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "_meta": {
+      "title": "Latent 1024x1024"
+    }
+  },
+  "8": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 987654321,
+      "steps": 8,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": [
+        "4",
+        0
+      ],
+      "positive": [
+        "5",
+        0
+      ],
+      "negative": [
+        "6",
+        0
+      ],
+      "latent_image": [
+        "7",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "KSampler - 8 steps, cfg 1.0"
+    }
+  },
+  "9": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "8",
+        0
+      ],
+      "vae": [
+        "3",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "10": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "krea2_turbo_lora",
+      "images": [
+        "9",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Save"
+    }
+  }
+}

@@ -88,9 +88,14 @@ with safe_open("Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", framewo
    - [`qwen_image_vae.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors) → `ComfyUI/models/vae/`
 
 4. **Drag in a workflow** from `workflows/`. Each opens with a **READ ME FIRST** note covering
-   the settings that matter.
+   the settings that matter — full instructions in
+   **[workflows/README.md](workflows/README.md)**.
    - `krea2_turbo_svdquant_w4a4_t2i.json` → **Turbo**: 8 steps, `cfg 1.0`, zeroed negative.
+   - `krea2_turbo_svdquant_w4a4_lora.json` → Turbo **with LoRAs** chained.
    - `krea2_base_svdquant_w4a4_t2i.json` → **base**: 50 steps, `cfg 3.5`, real negative prompt.
+   - `krea2_svdquant_diagnostics.json` → **run this first if anything is slow or broken.**
+     Generates no image; the Env Check node in it needs no model, so you can run it before
+     downloading 8 GB.
 
    Any `SVDQuant-W4A4-rank*` file needs the **Krea2 SVDQuant W4A4 Loader** node from this repo;
    `noLowRank` uses the stock **UNETLoader**. The `*_api.json` files are for POSTing to
