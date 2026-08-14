@@ -624,7 +624,7 @@ Download the calibration file for your variant from
 huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI/tree/main/calibration
 into ComfyUI/output/, then type its name into act_stats:
 
-  Turbo -> krea2_act_stats.safetensors
+  Turbo -> krea2_act_stats_turbo.safetensors
   base  -> krea2_act_stats_base.safetensors
 
 6.67 MB each. They fit the low-rank branch against activations

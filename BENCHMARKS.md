@@ -267,7 +267,7 @@ configuration in which the plain objective is the better choice.
 
 ```bash
 python quantize_krea2.py turbo.safetensors --format svdq --rank 256 \
-  --act-stats krea2_act_stats.safetensors
+  --act-stats krea2_act_stats_turbo.safetensors
 ```
 
 Ruled out as confounds: `r256` and `r256-actaware` share source, rank, `refine_iters=100`,

@@ -132,11 +132,11 @@ do not have to measure anything. Download the file for your variant from
 
 | you are quantizing | act_stats file |
 |---|---|
-| stock Krea 2 **Turbo** | `krea2_act_stats.safetensors` |
+| stock Krea 2 **Turbo** | `krea2_act_stats_turbo.safetensors` |
 | stock Krea 2 **base** | `krea2_act_stats_base.safetensors` |
 | a finetune, a merge, anything else | capture your own — see below |
 
-`krea2_act_stats_lora2.safetensors` is also published. Do **not** reach for it because you use
+`krea2_act_stats_turbo_lora_bloomgirls.safetensors` is also published. Do **not** reach for it because you use
 LoRAs: it is the capture from the `bloomgirls` arm of
 [Test 5](../BENCHMARKS.md), kept so that experiment is reproducible. Calibrating with an
 adapter loaded measured marginally *worse* than calibrating without one, and the recommendation

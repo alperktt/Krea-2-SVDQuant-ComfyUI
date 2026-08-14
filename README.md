@@ -231,7 +231,7 @@ the choices that matter (which format, which rank, how much disk).
 Fill in `act_stats` while you are there — it is the cheapest quality you will get here and you
 do not have to measure anything for it. Download the file matching your variant from
 [`calibration/`](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI/tree/main/calibration)
-(6.67 MB) into `ComfyUI/output/` and type its name in: `krea2_act_stats.safetensors` for Turbo,
+(6.67 MB) into `ComfyUI/output/` and type its name in: `krea2_act_stats_turbo.safetensors` for Turbo,
 `krea2_act_stats_base.safetensors` for base.
 
 **You only need to capture your own statistics for weights those files do not describe** — a
@@ -254,7 +254,7 @@ From a terminal:
 ```bash
 cd ComfyUI/custom_nodes/krea2-svdquant
 python quantize_krea2.py /path/to/krea2_bf16.safetensors --format svdq --rank 256 \
-  --act-stats krea2_act_stats.safetensors
+  --act-stats krea2_act_stats_turbo.safetensors
 ```
 
 `--format int8` and `--format w4a4` also work (`int8` is the most faithful option and still
