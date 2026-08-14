@@ -1,13 +1,14 @@
 # Workflows
 
-Six graphs. Drag the plain `.json` into the ComfyUI canvas — each opens with a **READ ME
+Seven graphs. Drag the plain `.json` into the ComfyUI canvas — each opens with a **READ ME
 FIRST** note carrying the settings that matter. The `*_api.json` twins are for POSTing to
 `/prompt` from a script; they carry no layout, so don't drag those in.
 
 | file | what it's for |
 |---|---|
 | `krea2_svdquant_diagnostics.json` | **Start here if anything is wrong.** No sampler, generates no image |
-| `krea2_turbo_svdquant_w4a4_t2i.json` | Krea 2 **Turbo**, 8 steps, cfg 1.0 |
+| `krea2_turbo_svdquant_w4a4_t2i.json` | Krea 2 **Turbo**, 8 steps, cfg 1.0 (3 separate files) |
+| `krea2_turbo_all_in_one_t2i.json` | Krea 2 **Turbo All-in-One**, 8 steps, cfg 1.0 (single ~12 GB checkpoint) |
 | `krea2_turbo_svdquant_w4a4_lora.json` | Turbo **with LoRAs**, chained through this repo's LoRA node |
 | `krea2_base_svdquant_w4a4_t2i.json` | Krea 2 **base** (non-turbo), 50 steps, cfg 3.5 |
 | `krea2_quantize.json` | **Build your own quantized checkpoint** from a BF16 one, no terminal |
@@ -18,8 +19,7 @@ Edit that script, not the JSON.
 
 ## What every graph needs
 
-Three files, none of which are specific to this repo — any Krea 2 workflow uses the same two
-and one checkpoint:
+For standard workflows, three files:
 
 1. **A checkpoint** in `ComfyUI/models/diffusion_models/`, from
    [Hugging Face](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI).
@@ -27,13 +27,17 @@ and one checkpoint:
    loaded with `CLIPLoader` type `krea2`.
 3. **VAE** `qwen_image_vae.safetensors` in `ComfyUI/models/vae/`.
 
-**Which loader node** depends on which checkpoint you downloaded, and getting this wrong is
-the most common first-run failure:
+For **All-in-One** checkpoints, only **1 file** in `ComfyUI/models/checkpoints/`:
+- Combines the quantized DiT, 4-bit quantized text encoder (Qwen3-VL 4B), and VAE into one ~12 GB file.
+
+**Which loader node** depends on which checkpoint you downloaded:
 
 | checkpoint | loader node |
 |---|---|
 | `Krea2-Turbo-W4A4-noLowRank` | the **stock UNETLoader** |
 | any `SVDQuant-W4A4-rank*` | **Krea2 SVDQuant W4A4 Loader** (this repo) |
+| All-in-One `SVDQuant-*-AllInOne-*` | **Krea2 SVDQuant Checkpoint Loader** (this repo) |
+| All-in-One branchless (`W4A4` / `INT8`) | **CheckpointLoaderSimple** (stock) or **Krea2 SVDQuant Checkpoint Loader** |
 
 The `svdq` files carry extra `*.svdq_l1` / `*.svdq_l2` tensors that the stock loader does not
 know about, which is why they need their own node.

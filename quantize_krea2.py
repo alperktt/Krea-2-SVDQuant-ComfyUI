@@ -68,6 +68,9 @@ def _find_comfyui_root() -> str | None:
     candidate = os.path.abspath(os.path.join(here, "..", ".."))
     if os.path.isdir(os.path.join(candidate, "comfy")):
         return candidate
+    for extra in ("D:/ComfyUI", "C:/ComfyUI", os.path.abspath(os.path.join(here, "..", "ComfyUI"))):
+        if os.path.isdir(os.path.join(extra, "comfy")):
+            return extra
     return None
 
 

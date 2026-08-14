@@ -90,7 +90,8 @@ with safe_open("Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", framewo
 4. **Drag in a workflow** from `workflows/`. Each opens with a **READ ME FIRST** note covering
    the settings that matter — full instructions in
    **[workflows/README.md](workflows/README.md)**.
-   - `krea2_turbo_svdquant_w4a4_t2i.json` → **Turbo**: 8 steps, `cfg 1.0`, zeroed negative.
+   - `krea2_turbo_svdquant_w4a4_t2i.json` → **Turbo**: 8 steps, `cfg 1.0`, zeroed negative (3 separate model files).
+   - `krea2_turbo_all_in_one_t2i.json` → **Turbo All-in-One**: single ~12 GB file containing DiT, 4-bit text encoder, and VAE.
    - `krea2_turbo_svdquant_w4a4_lora.json` → Turbo **with LoRAs** chained.
    - `krea2_base_svdquant_w4a4_t2i.json` → **base**: 50 steps, `cfg 3.5`, real negative prompt.
    - `krea2_svdquant_diagnostics.json` → **run this first if anything is slow or broken.**
@@ -101,8 +102,9 @@ with safe_open("Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", framewo
    - `krea2_quantize_calibrated.json` → only if you are quantizing something other than the
      released weights; for those, download a ready-made calibration file instead.
 
-   Any `SVDQuant-W4A4-rank*` file needs the **Krea2 SVDQuant W4A4 Loader** node from this repo;
-   `noLowRank` uses the stock **UNETLoader**. The `*_api.json` files are for POSTing to
+   Any standalone `SVDQuant-W4A4-rank*` file needs the **Krea2 SVDQuant W4A4 Loader** node from this repo;
+   All-in-One SVDQuant checkpoints use the **Krea2 SVDQuant Checkpoint Loader**;
+   `noLowRank` / branchless uses the stock **UNETLoader** or **CheckpointLoaderSimple**. The `*_api.json` files are for POSTing to
    `/prompt` from a script — don't drag those in, they carry no layout.
 
 ## See it
@@ -204,12 +206,13 @@ Installing this adds seven nodes, all under **Krea2/SVDQuant**:
 | file | what it is |
 |---|---|
 | `quantize_krea2.py` | Converts a BF16 Krea 2 checkpoint to int8, w4a4, or w4a4 + low-rank (svdq). Also the CLI |
-| `svdquant_w4a4.py` | The **W4A4 Loader** node — loads `--format svdq` checkpoints (self-contained, no base model needed) |
+| `svdquant_w4a4.py` | The **W4A4 Loader** & **Checkpoint Loader** nodes — loads standalone or All-In-One `--format svdq` checkpoints |
 | `svdquant_lora.py` | The **LoRA Loader** node — applies LoRAs as a parallel branch so the 4-bit weight is never dequantized |
 | `svdquant_quantize.py` | The **Quantize** node — the quantizer above, from inside ComfyUI |
 | `svdquant_capture.py` | The **Capture Start/Save** nodes — record per-channel activation RMS for `--act-stats` |
 | `svdquant_diag.py` | The **Diagnostics** and **Env Check** nodes |
 | `diagnose.py` | The same reports from a terminal, without starting ComfyUI (`--mode all` for everything) |
+| `tools/build_all_in_one.py` | Bakes DiT, 4-bit text encoder (Qwen3-VL 4B), and VAE into a single combined checkpoint (~12 GB) |
 | `tools/fidelity_bench.py` | Paired multi-seed multi-LoRA LPIPS harness. Every fidelity claim in this repo comes from it |
 | `tools/speed_bench.py` | Per-step speed, by timing each checkpoint at two step counts and taking the slope. Every s/step number in this repo comes from it |
 | `tools/contact_sheet.py` | Builds the contact sheets in [GALLERY.md](GALLERY.md) — for looking at, not scoring |
@@ -354,6 +357,25 @@ allocation, and this — failed to move LPIPS in the predicted direction. `--act
 one that worked, and it optimises against something else.
 
 </details>
+
+### All-in-One Checkpoint (`tools/build_all_in_one.py`)
+
+Bake the diffusion model, text encoder, and VAE into a single file (~12 GB instead of 15.5 GB across three separate files):
+
+```bash
+python tools/build_all_in_one.py \
+    --dit  models/diffusion_models/Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors \
+    --text-encoder models/text_encoders/qwen3vl_4b_bf16.safetensors \
+    --vae  models/vae/Krea2-HD-vae.safetensors \
+    --te-format w4a4 --variant turbo
+```
+
+* **Streaming Safetensors writer**: never holds the combined 12+ GB in memory simultaneously.
+* **Quantized Text Encoder**: quantizes the 252 linear projections of Qwen3-VL 4B (`self_attn.*_proj`, `mlp.*_proj`) to 4-bit (`convrot_w4a4` or `int8`) while leaving the vision tower and embeddings untouched.
+* **Loading**:
+  - `SVDQuant` all-in-one checkpoints load with the **Krea2 SVDQuant Checkpoint Loader** node.
+  - Branchless checkpoints (`--format w4a4` or `int8`) load with stock **CheckpointLoaderSimple**.
+* **Workflow**: drag `workflows/krea2_turbo_all_in_one_t2i.json` into ComfyUI for a streamlined 1-loader generation graph.
 
 ## What was measured
 

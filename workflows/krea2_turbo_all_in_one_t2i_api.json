@@ -1,0 +1,106 @@
+{
+  "1": {
+    "class_type": "Krea2SVDQuantCheckpointLoader",
+    "inputs": {
+      "ckpt_name": "Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank64-TEW4A4.safetensors"
+    },
+    "_meta": {
+      "title": "Krea2 SVDQuant Checkpoint Loader"
+    }
+  },
+  "2": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "A cluttered antique clockmaker's workshop seen through a cracked magnifying glass, brass gears laid out in a spiral on the workbench, a ginger cat asleep on a stack of leather-bound books, warm afternoon light with visible dust motes, photorealistic, 85mm lens, shallow depth of field",
+      "clip": [
+        "1",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "Prompt"
+    }
+  },
+  "3": {
+    "class_type": "ConditioningZeroOut",
+    "inputs": {
+      "conditioning": [
+        "2",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Negative (zeroed - required at cfg 1.0)"
+    }
+  },
+  "4": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "_meta": {
+      "title": "Latent 1024x1024"
+    }
+  },
+  "5": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 987654321,
+      "steps": 8,
+      "cfg": 1.0,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": [
+        "1",
+        0
+      ],
+      "positive": [
+        "2",
+        0
+      ],
+      "negative": [
+        "3",
+        0
+      ],
+      "latent_image": [
+        "4",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "KSampler - 8 steps, cfg 1.0"
+    }
+  },
+  "6": {
+    "class_type": "VAEDecode",
+    "inputs": {
+      "samples": [
+        "5",
+        0
+      ],
+      "vae": [
+        "1",
+        2
+      ]
+    },
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "7": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "krea2_turbo_aio_svdq",
+      "images": [
+        "6",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Save"
+    }
+  }
+}
