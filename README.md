@@ -5,107 +5,85 @@
 
 Quantized **Krea 2** checkpoints for ComfyUI — about **2x faster** and **a third the size**
 of the usual FP8 version, with no calibration dataset needed, on both **Krea 2 Turbo**
-(distilled, 8 steps) and the **base** release. This repo holds the custom nodes and the
-`quantize_krea2.py` conversion script; the `.safetensors` files (7.5-9.1 GB each) live on
+(distilled, 8 steps) and the **base** release. This repo holds the custom nodes, the All-in-One
+builder, and the `quantize_krea2.py` conversion script; the `.safetensors` files live on
 Hugging Face.
 
 Works on **any modern NVIDIA GPU** — INT8/W4A4 tensor cores go back to Turing (RTX 20-series).
-Benchmarked on an RTX 3090 (Ampere), the case most Krea 2 quantization writeups skip, since
-that generation has no FP8 or NVFP4 tensor cores at all. Everything here was built from
-scratch against ComfyUI's own quantization backend and is reproducible: `quantize_krea2.py`
-regenerates any checkpoint from a BF16 source in 40-100 seconds, or ~6 minutes with the
-default low-rank refinement.
+Benchmarked on an RTX 3090 (Ampere). Everything here was built from scratch against ComfyUI's
+own quantization backend and is 100% reproducible.
 
 > **Requires a cu130 (CUDA 13) or newer PyTorch build.** ComfyUI disables `comfy_kitchen`'s
 > CUDA backend on older torch builds, which silently drops every quantized checkpoint onto a
 > pure-Python fallback that is *slower than bf16*. If these checkpoints are slower than FP8
-> for you, this is almost certainly why — see
-> [TROUBLESHOOTING.md](TROUBLESHOOTING.md#its-slower-than-fp8--slower-than-bf16).
+> for you, see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#its-slower-than-fp8--slower-than-bf16).
 
-This is a community-produced modification of Krea 2, not an official Krea product — license
-and attribution are at the [bottom of this page](#attribution). Read them before using these
-weights, in particular the revenue threshold on commercial use.
+---
 
-## Which checkpoint to download
+## 🚀 Quick Start (Choose Your Setup)
 
-Everything lives under `checkpoints/` on Hugging Face.
+### Option 1: 🌟 1-Click All-in-One Checkpoint (Recommended)
+> **Zero extra downloads!** DiT model, 4-bit Qwen3-VL 4B text encoder, and VAE are combined into **a single ~12 GB file**.
 
-| file | rank | size | when |
-|---|---|---|---|
-| **`Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors`** | 256 | 9.10 GB | **Start here.** Closest to BF16 of anything measured, same speed as any other rank-256 build |
-| `Krea2-Turbo-SVDQuant-W4A4-rank256.safetensors` | 256 | 9.10 GB | The same without the activation weighting |
-| `Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors` | 64 | 7.90 GB | 1.2 GB smaller, and identical to rank 256 *if you never load a LoRA* |
-| `Krea2-Turbo-W4A4-noLowRank.safetensors` | — | 7.50 GB | Smallest and ~9% faster per step; loads with the stock **UNETLoader** |
-| `Krea2-Base-SVDQuant-W4A4-rank256-actaware.safetensors` | 256 | 9.10 GB | The **base** (non-distilled) model, not turbo. 50 steps, cfg 3.5, real negative prompt |
-| `checkpoints/legacy/` | 16, 128 | — | Superseded, kept because BENCHMARKS.md cites measurements from them |
-
-The `actaware` file is the same format, size and speed as plain rank 256 — the low-rank branch
-was just fitted against measured per-channel activation energy instead of assuming it is
-uniform ([`--act-stats`](#activation-aware-branch---act-stats)). Without a LoRA that moves
-LPIPS-to-BF16 from 0.3378 to **0.2825** (t=4.68 over 32 paired cells); with a LoRA it measures
-no worse. There is no case where the plain build is the better pick. The calibration file it
-was built from is in `calibration/`, so the build is reproducible.
-
-The base file is the same recipe applied to `raw.safetensors`, built from its own calibration
-pass (`calibration/krea2_act_stats_base.safetensors`, 8 prompts on the BF16 base model at its
-own sampler settings). **It has not been through the paired benchmark yet** — the act-aware
-numbers below are turbo measurements and are not evidence about the base build. Treat it as
-"the base equivalent of the recommended turbo file", not as a measured improvement over
-`Krea2-Base-SVDQuant-W4A4-rank256`.
-
-**Rank only matters if you load LoRAs.** Without one, ranks 64 / 128 / 256 are statistically
-indistinguishable. With one, rank 256 wins clearly and rank 64 loses most of its advantage
-over having no branch at all
-([Test 3](BENCHMARKS.md#test-3--paired-lpips-fidelity-with-and-without-a-lora)).
-
-Every file records how it was built in its safetensors metadata, so you can check what you
-downloaded rather than trusting this table:
-
-```python
-from safetensors import safe_open
-with safe_open("Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", framework="pt") as f:
-    print(f.metadata())
-```
-
-> The test that matters is `f.metadata() is None`, not the date: an early batch (published
-> before 2026-07-26) was built without refinement and carries no metadata at all. If yours
-> returns `None`, re-download — the whole rank ladder is flat without refinement.
-
-## Quick start
-
-1. **Install the nodes.** In your ComfyUI folder:
+1. **Install custom nodes:**
    ```bash
    git clone https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI custom_nodes/krea2-svdquant
    ```
-   (No git? Download the repo as a ZIP and unzip it into `ComfyUI/custom_nodes/`.) Restart
-   ComfyUI.
+2. **Download the unified checkpoint:**
+   - Download `Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank64-TEW4A4.safetensors` (~12 GB) from [Hugging Face](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI).
+   - Place it in: `ComfyUI/models/checkpoints/`
+3. **Run in ComfyUI:**
+   - Drag [`workflows/krea2_turbo_all_in_one_t2i.json`](workflows/krea2_turbo_all_in_one_t2i.json) into your ComfyUI canvas.
+   - It uses the **Krea2 SVDQuant Checkpoint Loader** node to load everything in 1 click. Press **Queue Prompt**!
 
-2. **Download one checkpoint** from `checkpoints/` on Hugging Face into
-   `ComfyUI/models/diffusion_models/`.
+---
 
-3. **Download the text encoder and VAE** — the same ones any Krea 2 Turbo workflow needs:
-   - [`qwen3vl_4b_fp8_scaled.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors) → `ComfyUI/models/text_encoders/`
-   - [`qwen_image_vae.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors) → `ComfyUI/models/vae/`
+### Option 2: 📦 Modular 3-File Setup
+> If you prefer downloading the DiT, Text Encoder, and VAE separately:
 
-4. **Drag in a workflow** from `workflows/`. Each opens with a **READ ME FIRST** note covering
-   the settings that matter — full instructions in
-   **[workflows/README.md](workflows/README.md)**.
-   - `krea2_turbo_svdquant_w4a4_t2i.json` → **Turbo**: 8 steps, `cfg 1.0`, zeroed negative (3 separate model files).
-   - `krea2_turbo_all_in_one_t2i.json` → **Turbo All-in-One**: single ~12 GB file containing DiT, 4-bit text encoder, and VAE.
-   - `krea2_turbo_svdquant_w4a4_lora.json` → Turbo **with LoRAs** chained.
-   - `krea2_base_svdquant_w4a4_t2i.json` → **base**: 50 steps, `cfg 3.5`, real negative prompt.
-   - `krea2_svdquant_diagnostics.json` → **run this first if anything is slow or broken.**
-     Generates no image; the Env Check node in it needs no model, so you can run it before
-     downloading 8 GB.
-   - `krea2_quantize.json` → **build your own checkpoint**, no terminal: pick a format and a
-     rank, press Queue. See [Build your own checkpoint](#build-your-own-checkpoint).
-   - `krea2_quantize_calibrated.json` → only if you are quantizing something other than the
-     released weights; for those, download a ready-made calibration file instead.
+1. **Install custom nodes:**
+   ```bash
+   git clone https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI custom_nodes/krea2-svdquant
+   ```
+2. **Download the 3 files:**
+   - **DiT Checkpoint** → `ComfyUI/models/diffusion_models/` (from [Hugging Face](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI))
+   - **Text Encoder** → [`qwen3vl_4b_fp8_scaled.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/text_encoders/qwen3vl_4b_fp8_scaled.safetensors) → `ComfyUI/models/text_encoders/`
+   - **VAE** → [`qwen_image_vae.safetensors`](https://huggingface.co/Comfy-Org/Krea-2/resolve/main/vae/qwen_image_vae.safetensors) → `ComfyUI/models/vae/`
+3. **Run in ComfyUI:**
+   - Drag [`workflows/krea2_turbo_svdquant_w4a4_t2i.json`](workflows/krea2_turbo_svdquant_w4a4_t2i.json) into canvas.
 
-   Any standalone `SVDQuant-W4A4-rank*` file needs the **Krea2 SVDQuant W4A4 Loader** node from this repo;
-   All-in-One SVDQuant checkpoints use the **Krea2 SVDQuant Checkpoint Loader**;
-   `noLowRank` / branchless uses the stock **UNETLoader** or **CheckpointLoaderSimple**. The `*_api.json` files are for POSTing to
-   `/prompt` from a script — don't drag those in, they carry no layout.
+---
+
+## 📥 Which Checkpoint to Download
+
+| Checkpoint File | Format & Type | Size | Destination Folder | Loader Node | Recommended For |
+|---|---|---|---|---|---|
+| **`Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank64-TEW4A4.safetensors`** | **All-in-One** (DiT + 4-bit TE + VAE) | **~12.0 GB** | `models/checkpoints/` | **Krea2 SVDQuant Checkpoint Loader** | **Best for 1-click generation. Easiest setup.** |
+| **`Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors`** | Standalone DiT (svdq r256 actaware) | 9.10 GB | `models/diffusion_models/` | **Krea2 SVDQuant W4A4 Loader** | Best standalone DiT with LoRA support |
+| **`Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors`** | Standalone DiT (svdq r64) | 7.90 GB | `models/diffusion_models/` | **Krea2 SVDQuant W4A4 Loader** | Smaller footprint without LoRA |
+| **`Krea2-Turbo-W4A4-noLowRank.safetensors`** | Standalone DiT (branchless w4a4) | 7.50 GB | `models/diffusion_models/` | Stock **UNETLoader** | Fastest (~9% faster per step) |
+| **`Krea2-Base-SVDQuant-W4A4-rank256-actaware.safetensors`** | Standalone DiT (Base release) | 9.10 GB | `models/diffusion_models/` | **Krea2 SVDQuant W4A4 Loader** | Base (50 steps, cfg 3.5, real negative) |
+
+> 💡 **Folder Tip:**
+> - **All-in-One files** go into `ComfyUI/models/checkpoints/`.
+> - **Standalone DiT files** go into `ComfyUI/models/diffusion_models/`.
+
+---
+
+## 📑 Workflows Overview
+
+Eight ready-to-use workflows in [`workflows/`](workflows/):
+
+| Workflow File | Purpose | Setup Type |
+|---|---|---|
+| [`krea2_turbo_all_in_one_t2i.json`](workflows/krea2_turbo_all_in_one_t2i.json) | **1-Click Generation** (Single ~12 GB file) | All-in-One |
+| [`krea2_turbo_svdquant_w4a4_t2i.json`](workflows/krea2_turbo_svdquant_w4a4_t2i.json) | Standard Turbo text-to-image (8 steps, `cfg 1.0`) | 3-File Modular |
+| [`krea2_turbo_svdquant_w4a4_lora.json`](workflows/krea2_turbo_svdquant_w4a4_lora.json) | Turbo with LoRA/LoKr support (`bypass`, `svd delta`, `bake`) | 3-File Modular |
+| [`krea2_base_svdquant_w4a4_t2i.json`](workflows/krea2_base_svdquant_w4a4_t2i.json) | Base non-turbo model (50 steps, `cfg 3.5`) | 3-File Modular |
+| [`krea2_quantize_all_in_one.json`](workflows/krea2_quantize_all_in_one.json) | **Bake your own All-in-One checkpoint** in ComfyUI | Quantizer |
+| [`krea2_quantize.json`](workflows/krea2_quantize.json) | Quantize BF16 DiT to SVDQuant in ComfyUI | Quantizer |
+| [`krea2_quantize_calibrated.json`](workflows/krea2_quantize_calibrated.json) | Live activation capture + quantization | Quantizer |
+| [`krea2_svdquant_diagnostics.json`](workflows/krea2_svdquant_diagnostics.json) | Verify environment, CUDA kernel & memory stats | Diagnostics |
 
 ## See it
 
