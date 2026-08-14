@@ -795,6 +795,43 @@ def build_quantize():
     return g.serialize(groups), g.serialize_api()
 
 
+def build_quantize_all_in_one():
+    g = Graph()
+    note = """QUANTIZE ALL-IN-ONE - Bake DiT + Text Encoder + VAE
+
+This graph bakes three files into one unified checkpoint in models/checkpoints/:
+1. source_dit (in models/diffusion_models/): BF16 or already quantized.
+2. text_encoder (in models/text_encoders/): Qwen3-VL 4B BF16 (~8.88 GB -> ~3.2 GB W4A4).
+3. vae (in models/vae/): Krea2 VAE (~0.51 GB unquantized).
+
+Resulting file: ~12 GB in models/checkpoints/, loaded with Krea2 SVDQuant Checkpoint Loader."""
+    g.note(note, 0, 0, size=(460, 600), title="READ ME FIRST")
+
+    g.add("Krea2SVDQuantEnvCheck", 1, 0, outputs=[("report", "STRING")],
+          title="1. Env Check - verify CUDA kernel", colour=YELLOW,
+          size=[420, 120])
+    g.add("Krea2SVDQuantQuantizeAllInOne", 1, 0.9,
+          outputs=[("summary", "STRING")],
+          widgets=[("source_dit", "turbo.safetensors"),
+                   ("text_encoder", "qwen3vl_4b_bf16.safetensors"),
+                   ("vae", "Krea2-HD-vae.safetensors"),
+                   ("format", "svdq"),
+                   ("te_format", "w4a4"),
+                   ("rank", 64),
+                   ("refine_iters", 100),
+                   ("groupsize", 256),
+                   ("variant", "turbo"),
+                   ("output_name", ""),
+                   ("overwrite", False),
+                   ("act_stats", "krea2_act_stats_turbo.safetensors"),
+                   ("seed", 0)],
+          title="2. Quantize & Bake All-in-One Checkpoint", colour=TEAL,
+          size=[420, 520])
+
+    groups = [g.group("All-in-One Baker", (500, 20, 460, 700), colour="#8a4")]
+    return g.serialize(groups), g.serialize_api()
+
+
 def build_quantize_calibrated():
     g = Graph()
     g.note(CALIB_NOTE, 0, 0, size=(460, 1420), title="READ ME FIRST")
@@ -883,6 +920,7 @@ def main():
                         ("krea2_turbo_svdquant_w4a4_lora", build_lora),
                         ("krea2_svdquant_diagnostics", build_diagnostics),
                         ("krea2_quantize", build_quantize),
+                        ("krea2_quantize_all_in_one", build_quantize_all_in_one),
                         ("krea2_quantize_calibrated", build_quantize_calibrated)):
         graph, api = build()
         ui_path = os.path.join(OUT_DIR, name + ".json")

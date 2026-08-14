@@ -287,6 +287,109 @@ def _conf_len(algo: str, groupsize: int) -> int:
     return len(conf_tensor(conf))
 
 
+def build_all_in_one_checkpoint(dit_path: str, text_encoder_path: str, vae_path: str,
+                                out_path: str, fmt_name: str = "svdq", te_format: str = "w4a4",
+                                rank: int = 64, variant: str = "unknown", groupsize: int = 256,
+                                device: str = "cuda", dry_run: bool = False,
+                                progress_cb=None) -> str:
+    """Combine DiT, quantized text encoder, and VAE into a single checkpoint."""
+    fmt, rank = resolve_format(fmt_name, rank, rank_was_set=False)
+
+    with safe_open(dit_path, framework="pt", device="cpu") as handle:
+        dit_keys = list(handle.keys())
+    dit_prefix = detect_prefix(dit_keys, default="")
+    already = any(k.endswith(".comfy_quant") for k in dit_keys)
+
+    if not already and not dry_run:
+        raise RuntimeError(
+            "{} is a BF16 source. Quantize it first with quantize_krea2.py (or the "
+            "Quantize node) and pass the result as dit_path.".format(dit_path))
+
+    metadata = {
+        "krea2_svdquant_tool_version": __version__,
+        "krea2_allinone": "1",
+        "krea2_allinone_dit": os.path.basename(dit_path),
+        "krea2_allinone_te": os.path.basename(text_encoder_path),
+        "krea2_allinone_te_format": te_format,
+        "krea2_allinone_vae": os.path.basename(vae_path),
+        "krea2_svdquant_variant": variant,
+    }
+
+    writer = StreamingWriter(out_path, metadata)
+    with safe_open(dit_path, framework="pt", device="cpu") as dh:
+        for out_key, src in plan_dit(dh, dit_keys, dit_prefix):
+            s = dh.get_slice(src)
+            writer.plan(out_key, _slice_dtype(s), s.get_shape())
+    dit_planned = len(writer.entries)
+
+    with safe_open(vae_path, framework="pt", device="cpu") as vh:
+        for out_key, src in plan_vae(list(vh.keys())):
+            s = vh.get_slice(src)
+            writer.plan(out_key, _slice_dtype(s), s.get_shape())
+    vae_planned = len(writer.entries) - dit_planned
+
+    te_quantized = quantize_text_encoder(text_encoder_path, te_format, groupsize,
+                                         device, writer, dry_run=True)
+    te_planned = len(writer.entries) - dit_planned - vae_planned
+
+    if te_quantized != TE_EXPECTED:
+        raise RuntimeError(
+            "expected {} quantizable text-encoder linears ({} layers x {}), matched {}. "
+            "Layer naming in {} is not recognized.".format(
+                TE_EXPECTED, TE_LAYERS, len(TE_QUANT_SUFFIXES), te_quantized, text_encoder_path))
+
+    total = sum(e[3] for e in writer.entries)
+    by = lambda pred: sum(e[3] for e in writer.entries if pred(e[0])) / 1024 ** 3
+
+    stats = (
+        "planned {} tensors, {:.2f} GiB (diffusion: {:.2f} GiB, encoder: {:.2f} GiB [{} linears -> {}], vae: {:.2f} GiB)"
+        .format(len(writer.entries), total / 1024 ** 3, by(lambda k: k.startswith(DIT_PREFIX)),
+                by(lambda k: k.startswith(TE_PREFIX)), te_quantized, te_format,
+                by(lambda k: k.startswith(VAE_PREFIX)))
+    )
+
+    if dry_run:
+        return stats + "\n[dry-run: nothing written, GPU untouched]"
+
+    t0 = time.time()
+    total_steps = len(writer.entries)
+    step = 0
+
+    with writer as w:
+        with safe_open(dit_path, framework="pt", device="cpu") as dh:
+            for out_key, src in plan_dit(dh, dit_keys, dit_prefix):
+                w.write(out_key, dh.get_tensor(src))
+                step += 1
+                if progress_cb:
+                    progress_cb(step, total_steps, "Copying DiT")
+        with safe_open(vae_path, framework="pt", device="cpu") as vh:
+            for out_key, src in plan_vae(list(vh.keys())):
+                w.write(out_key, vh.get_tensor(src))
+                step += 1
+                if progress_cb:
+                    progress_cb(step, total_steps, "Copying VAE")
+        quantize_text_encoder(text_encoder_path, te_format, groupsize, device,
+                              w, dry_run=False)
+        if progress_cb:
+            progress_cb(total_steps, total_steps, "Complete")
+
+    elapsed = time.time() - t0
+    final_size = os.path.getsize(out_path) / 1024 ** 3
+    summary = (
+        "baked all-in-one checkpoint: {} ({:.2f} GiB, {:.0f}s)\n"
+        "  diffusion : {} (format {})\n"
+        "  encoder   : {} (quantized to {})\n"
+        "  vae       : {}\n"
+        "{}".format(
+            os.path.basename(out_path), final_size, elapsed,
+            os.path.basename(dit_path), fmt_name,
+            os.path.basename(text_encoder_path), te_format,
+            os.path.basename(vae_path), stats
+        )
+    )
+    return summary
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -319,11 +422,6 @@ def main():
 
     fmt, rank = resolve_format(args.format, args.rank, rank_was_set=True)
 
-    with safe_open(args.dit, framework="pt", device="cpu") as handle:
-        dit_keys = list(handle.keys())
-    dit_prefix = detect_prefix(dit_keys, default="")
-    already = any(k.endswith(".comfy_quant") for k in dit_keys)
-
     out = args.out
     if out is None:
         stem = "Krea2-{}".format(args.variant.capitalize()) if args.variant != "unknown" \
@@ -336,92 +434,31 @@ def main():
                            "{}-AllInOne-{}-TE{}.safetensors".format(
                                stem, tag, args.te_format.upper()))
 
-    print("diffusion : {} ({})".format(os.path.basename(args.dit),
-                                       "already quantized" if already else
-                                       "BF16, will be quantized to {}".format(args.format)))
+    print("diffusion : {}".format(os.path.basename(args.dit)))
     print("encoder   : {} -> {}".format(os.path.basename(args.text_encoder), args.te_format))
     print("vae       : {} (unquantized)".format(os.path.basename(args.vae)))
     print("out       : {}".format(out))
 
-    if not already and not args.dry_run:
-        raise SystemExit(
-            "--dit is a BF16 source. Quantize it first with quantize_krea2.py (or the "
-            "Quantize node) and pass the result here.\n"
-            "  python quantize_krea2.py {} --format {} --rank {} --variant {}{}\n"
-            "Kept separate on purpose: the diffusion build is the ~6 minute half, and "
-            "redoing it every time you rebuild the combined file would be the slowest "
-            "possible way to iterate on the encoder side."
-            .format(args.dit, args.format, rank, args.variant,
-                    " --act-stats " + args.act_stats if args.act_stats else ""))
-
-    metadata = {
-        "krea2_svdquant_tool_version": __version__,
-        "krea2_allinone": "1",
-        "krea2_allinone_dit": os.path.basename(args.dit),
-        "krea2_allinone_te": os.path.basename(args.text_encoder),
-        "krea2_allinone_te_format": args.te_format,
-        "krea2_allinone_vae": os.path.basename(args.vae),
-        "krea2_svdquant_variant": args.variant,
-    }
-
-    # Pass 1: plan every key, from headers only.
-    writer = StreamingWriter(out, metadata)
-    with safe_open(args.dit, framework="pt", device="cpu") as dh:
-        for out_key, src in plan_dit(dh, dit_keys, dit_prefix):
-            s = dh.get_slice(src)
-            writer.plan(out_key, _slice_dtype(s), s.get_shape())
-    dit_planned = len(writer.entries)
-
-    with safe_open(args.vae, framework="pt", device="cpu") as vh:
-        for out_key, src in plan_vae(list(vh.keys())):
-            s = vh.get_slice(src)
-            writer.plan(out_key, _slice_dtype(s), s.get_shape())
-    vae_planned = len(writer.entries) - dit_planned
-
-    te_quantized = quantize_text_encoder(args.text_encoder, args.te_format, args.groupsize,
-                                         args.device, writer, dry_run=True)
-    te_planned = len(writer.entries) - dit_planned - vae_planned
-
-    if te_quantized != TE_EXPECTED:
-        raise SystemExit(
-            "expected {} quantizable text-encoder linears ({} layers x {}), matched {}. "
-            "The encoder's layer naming is not what this tool targets, and quantizing the "
-            "wrong set silently produces a file that is the right size and the wrong model."
-            .format(TE_EXPECTED, TE_LAYERS, len(TE_QUANT_SUFFIXES), te_quantized))
-
-    total = sum(e[3] for e in writer.entries)
-    by = lambda pred: sum(e[3] for e in writer.entries if pred(e[0])) / 1024 ** 3
-    print("\nplanned {} tensors, {:.2f} GiB".format(len(writer.entries), total / 1024 ** 3))
-    print("  diffusion {:5d} tensors  {:6.2f} GiB".format(dit_planned, by(lambda k: k.startswith(DIT_PREFIX))))
-    print("  encoder   {:5d} tensors  {:6.2f} GiB  ({} linears quantized to {})".format(
-        te_planned, by(lambda k: k.startswith(TE_PREFIX)), te_quantized, args.te_format))
-    print("  vae       {:5d} tensors  {:6.2f} GiB".format(vae_planned, by(lambda k: k.startswith(VAE_PREFIX))))
-
-    if args.dry_run:
-        print("\ndry run: nothing written, nothing quantized, GPU untouched.")
-        return
-
-    # Pass 2: stream it out in exactly the planned order.
-    t0 = time.time()
-    with writer as w:
-        with safe_open(args.dit, framework="pt", device="cpu") as dh:
-            for out_key, src in plan_dit(dh, dit_keys, dit_prefix):
-                w.write(out_key, dh.get_tensor(src))
-        print("  diffusion copied ({:.0f}s)".format(time.time() - t0), flush=True)
-        with safe_open(args.vae, framework="pt", device="cpu") as vh:
-            for out_key, src in plan_vae(list(vh.keys())):
-                w.write(out_key, vh.get_tensor(src))
-        print("  vae copied ({:.0f}s)".format(time.time() - t0), flush=True)
-        quantize_text_encoder(args.text_encoder, args.te_format, args.groupsize, args.device,
-                              w, dry_run=False)
-
-    print("\nwrote {}  ({:.2f} GiB, {:.0f}s)".format(
-        out, os.path.getsize(out) / 1024 ** 3, time.time() - t0))
-    if rank:
-        print("svdq checkpoint: load it with the Krea2 SVDQuant Checkpoint Loader node, "
-              "not CheckpointLoaderSimple -- the low-rank branch needs attaching.")
-    else:
-        print("branchless: loads with the stock CheckpointLoaderSimple.")
+    summary = build_all_in_one_checkpoint(
+        dit_path=args.dit,
+        text_encoder_path=args.text_encoder,
+        vae_path=args.vae,
+        out_path=out,
+        fmt_name=args.format,
+        te_format=args.te_format,
+        rank=rank,
+        variant=args.variant,
+        groupsize=args.groupsize,
+        device=args.device,
+        dry_run=args.dry_run,
+    )
+    print("\n" + summary)
+    if not args.dry_run:
+        if rank:
+            print("svdq checkpoint: load it with the Krea2 SVDQuant Checkpoint Loader node, "
+                  "not CheckpointLoaderSimple -- the low-rank branch needs attaching.")
+        else:
+            print("branchless: loads with the stock CheckpointLoaderSimple.")
 
 
 if __name__ == "__main__":

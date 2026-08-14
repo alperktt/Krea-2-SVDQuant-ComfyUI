@@ -97,34 +97,7 @@ replaces the module".
 
 ## 4. Fold LoKr/LoHa/OFT deltas into the low-rank branch by SVD
 
-**Status:** idea, not started. Would become a third value for the LoRA node's `adapters`
-input, alongside `bypass` and `bake`.
-
-**The problem it solves.** Today's two options both cost something:
-
-| mode | s/step (3090, 1440x1920, r256 + LoRA + LoKr + a `.diff`) | what it costs you |
-|---|---|---|
-| `bypass` (default) | 5.21 | exact, but the adapter runs every forward |
-| `bake` | 3.55 | fast, but the LoKr delta is requantized to **4 bits** |
-| stock loader | 3.22 | same, and the plain LoRA is requantized too |
-
-The bypass cost is inherent, not an implementation flaw — ComfyUI's `h()` already does the
-efficient nested contraction and never materialises the Kronecker product
-(`comfy/weight_adapter/lokr.py:146-163`). For a 6144→6144 layer with 4 groups it is ~38.7
-GMAC per layer in **bf16**, against the base layer's 154 GMAC in **int4**. A quarter of the
-arithmetic on hardware that is ~8x slower for it, which is why it roughly doubles the layer.
-
-**The idea.** At load time, extract the adapter's weight delta via ComfyUI's own
-`calculate_weight` (applied to a zero weight, so the result is the pure ΔW), take a truncated
-SVD with `torch.svd_lowrank`, and concatenate the factors onto the layer's existing
-`svdq_l1`/`svdq_l2`. Runtime cost then drops to *zero* beyond a slightly wider branch, and the
-delta is **truncated rather than quantized to 4 bits** — the same trade already accepted for
-the base weight, and a much gentler one than `bake` makes.
-
-**Open questions:** what rank the delta needs (a Kronecker product is not inherently
-low-rank, so this may need measuring per adapter); ~15 s of SVD at load across 224 layers;
-and whether the widened branch's VRAM is acceptable, given the branch is already 24% of a step
-at rank 256. Wants a fidelity run against `bypass` before it could become the default.
+**Status:** Completed in `experimental/all-in-one`. Added as the `svd delta` mode for `Krea2SVDQuantLoraLoader`, decomposing weight deltas at load time via `torch.svd_lowrank` and merging low-rank factors into the low-rank branch with zero per-step runtime overhead.
 
 ## 5. Mixed precision: keep the first and last blocks at W8A8
 
@@ -140,13 +113,12 @@ supports it. Not a quality lever — a claim with no evidence behind it.
 
 ## 7. All-in-one checkpoint: diffusion + text encoder + VAE in one file
 
-**Status:** not started. The largest item here and the last one on the list for that reason —
-high value, high effort, and it needs a measurement it has never had.
-
-Today a working setup is three downloads that have to match: a 9.10 GB checkpoint, a 5.24 GB
-FP8 text encoder, a 0.51 GB VAE. Picking the wrong encoder is the most common first-run
-failure after picking the wrong loader node. One file removes the whole class of mistake, and
-quantizing the text encoder to 4 bits is where the remaining size is.
+**Status:** Completed in `experimental/all-in-one`.
+- Standalone builder: `tools/build_all_in_one.py` (streaming two-pass safetensors assembler).
+- In-Graph node: `Krea2SVDQuantQuantizeAllInOne` in `svdquant_quantize.py`.
+- Loader node: `Krea2SVDQuantCheckpointLoader` in `svdquant_w4a4.py`.
+- Workflows: `workflows/krea2_turbo_all_in_one_t2i.json` and `workflows/krea2_quantize_all_in_one.json`.
+- Quantizes the 252 language projections of Qwen3-VL 4B to 4-bit (`convrot_w4a4`, ~3.2 GB) while keeping the vision tower (315 tensors) and embeddings in native precision for 100% prompt fidelity. Total size: ~11.7–12.3 GB (down from 33.5 GB BF16 / 15.5 GB split).
 
 **ComfyUI already supports this, which is the surprise.** `class Krea2` in
 `comfy/supported_models.py` defines `vae_key_prefix = ["vae."]` and

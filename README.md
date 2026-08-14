@@ -189,13 +189,15 @@ a calibration pass if you have one, but the default path needs nothing.
 
 ## The nodes
 
-Installing this adds seven nodes, all under **Krea2/SVDQuant**:
+Installing this adds nine nodes, all under **Krea2/SVDQuant**:
 
 | node | what it is for |
 |---|---|
-| **Krea2 SVDQuant W4A4 Loader** | Loads an `svdq` checkpoint. Its `status` output names the kernel that will actually run — read it first if generation is slow |
-| **Krea2 SVDQuant LoRA Loader** | LoRAs and LoKrs on quantized blocks — see [LoRA](#lora) |
-| **Krea2 SVDQuant Quantize** | Builds a quantized checkpoint without leaving ComfyUI. Blocks the queue (54 s to ~6 min) and writes ~8 GB |
+| **Krea2 SVDQuant W4A4 Loader** | Loads standalone `svdq` DiT diffusion models |
+| **Krea2 SVDQuant Checkpoint Loader** | Loads unified **All-in-One** checkpoints (DiT + 4-bit Qwen3-VL 4B TE + VAE) |
+| **Krea2 SVDQuant LoRA Loader** | LoRAs, LoKrs, and LoHas on quantized blocks — supports `bypass`, `svd delta`, and `bake` modes |
+| **Krea2 SVDQuant Quantize** | Builds a quantized DiT checkpoint without leaving ComfyUI |
+| **Krea2 SVDQuant Quantize All-in-One** | Bakes DiT, 4-bit text encoder, and VAE into a unified ~12 GB checkpoint directly from ComfyUI |
 | **Krea2 SVDQuant Diagnostics** | Backend dispatch, memory accounting, per-layer timings, profiler table |
 | **Krea2 SVDQuant Env Check** | Is the int4 kernel available at all? Needs no model, so you can ask before downloading 8 GB |
 | **Krea2 SVDQuant Capture Start** / **Capture Save** | Record activation statistics for an activation-aware build |

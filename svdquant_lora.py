@@ -54,12 +54,12 @@ from .svdquant_w4a4 import add_low_rank, has_branch
 _PREFIX = "diffusion_model."
 _ALT_PREFIX = "transformer."
 
-# What to do with an adapter that cannot fold into the low-rank branch (LoKr, LoHa, OFT).
-# `bypass` computes it every forward and never touches the 4-bit weight; `bake` hands it to
-# ComfyUI, which rewrites the weight once and pays nothing per step. Measured on a 3090 at
-# 1440x1920 with a LoKr on all 224 blocks: bypass costs +1.8 s per model call, bake costs
-# nothing and quantizes the delta to 4 bits along with the weight.
+# What to do with an adapter that cannot fold directly into the low-rank branch (LoKr, LoHa, OFT).
+# `bypass` computes it every forward and never touches the 4-bit weight; `svd delta` decomposes
+# the weight delta with torch.svd_lowrank and merges it into the low-rank branch (zero per-step
+# overhead); `bake` hands it to ComfyUI, which rewrites the weight once and pays nothing per step.
 ADAPTER_BYPASS = "bypass (exact, slower)"
+ADAPTER_SVD = "svd delta (fast, low-rank SVD, no per-step overhead)"
 ADAPTER_BAKE = "bake into the weight (fast, requantizes the delta)"
 
 # Reloading a 300 MB LoRA off disk on every graph execution is pure latency when the
@@ -133,6 +133,59 @@ def _plain_lora_factors(adapter, strength: float, device, dtype):
     l1 = up.to(device=device, dtype=dtype)
     l2 = down.to(device=device, dtype=dtype) * mult
     return l1.contiguous(), l2.contiguous()
+
+
+def _svd_adapter_factors(adapter, strength: float, device, dtype, max_rank: int = 64):
+    """Decompose an arbitrary adapter's weight delta into low-rank factors (l1, l2) via SVD.
+
+    For LoKr, LoHa, OFT, GFS, etc. This extracts the weight delta, computes a
+    truncated SVD using torch.svd_lowrank, and produces (l1, l2) where l1 @ l2 ≈ delta * strength.
+    Running this in the low-rank branch completely eliminates the per-step runtime overhead
+    of complex adapter contractions while preserving 4-bit base weights untouched.
+    """
+    try:
+        delta = None
+        # Case 1: ComfyUI WeightAdapterBase with calculate_weight
+        if hasattr(adapter, "calculate_weight"):
+            shape = getattr(adapter, "shape", None)
+            if shape is not None and len(shape) == 2:
+                zeros = torch.zeros(shape, dtype=torch.float32, device="cpu")
+                delta = adapter.calculate_weight(zeros)
+        # Case 2: Tuple / Diff / weights directly
+        if delta is None and hasattr(adapter, "weights"):
+            weights = adapter.weights
+            if weights and isinstance(adapter, comfy.weight_adapter.DiffAdapter):
+                delta = weights[0]
+            elif isinstance(adapter, comfy.weight_adapter.LoKrAdapter) and len(weights) >= 2:
+                w1, w2 = weights[0], weights[1]
+                if w1 is not None and w2 is not None:
+                    delta = torch.kron(w1.to(torch.float32), w2.to(torch.float32))
+            elif isinstance(adapter, comfy.weight_adapter.LoHaAdapter) and len(weights) >= 4:
+                w1a, w1b, w2a, w2b = weights[:4]
+                if all(w is not None for w in (w1a, w1b, w2a, w2b)):
+                    delta = (w1a.to(torch.float32) @ w1b.to(torch.float32)) * (w2a.to(torch.float32) @ w2b.to(torch.float32))
+        elif isinstance(adapter, tuple) and len(adapter) >= 1 and torch.is_tensor(adapter[0]):
+            delta = adapter[0]
+
+        if delta is None or delta.ndim != 2:
+            return None
+
+        out_dim, in_dim = delta.shape
+        k = min(max_rank, min(out_dim, in_dim))
+        if k <= 0:
+            return None
+
+        delta_f32 = delta.to(device="cpu", dtype=torch.float32)
+        # SVD: delta_f32 ≈ U @ diag(S) @ V.T
+        U, S, V = torch.svd_lowrank(delta_f32, q=k)
+        sqrt_s = torch.sqrt(torch.clamp(S, min=0.0))
+        # l1 is (out_dim, k), l2 is (k, in_dim)
+        l1 = (U * sqrt_s.unsqueeze(0)).to(device=device, dtype=dtype)
+        l2 = (sqrt_s.unsqueeze(1) * V.T * strength).to(device=device, dtype=dtype)
+        return l1.contiguous(), l2.contiguous()
+    except Exception as exc:
+        logging.warning("[krea2-svdquant] SVD adapter decomposition skipped: %s", exc)
+        return None
 
 
 def _supports_bypass(adapter) -> bool:
@@ -244,6 +297,17 @@ def collect_svdquant_lora(patcher, lora_sd, strength: float, quant_layers: set[s
             # A plain LoRA folds into the branch for free in either mode -- one pair of
             # GEMMs for the whole stack -- so `bake` has nothing to win here.
             into_branch.setdefault(layer, []).append(factors)
+        elif adapter_mode == ADAPTER_SVD:
+            # Attempt SVD decomposition into low-rank factors
+            svd_factors = _svd_adapter_factors(patch, strength, device, dtype)
+            if svd_factors is not None:
+                into_branch.setdefault(layer, []).append(svd_factors)
+            elif isinstance(patch, comfy.weight_adapter.WeightAdapterBase) and _supports_bypass(patch):
+                into_adapters.setdefault(layer, []).append((patch, strength))
+            else:
+                leftover[model_key] = patch
+                dequantizing += 1
+                continue
         elif (adapter_mode == ADAPTER_BYPASS
               and isinstance(patch, comfy.weight_adapter.WeightAdapterBase)
               and _supports_bypass(patch)):
@@ -293,15 +357,14 @@ class Krea2SVDQuantLoraLoader:
                 }),
             },
             "optional": {
-                "adapters": ([ADAPTER_BYPASS, ADAPTER_BAKE], {
+                "adapters": ([ADAPTER_BYPASS, ADAPTER_SVD, ADAPTER_BAKE], {
                     "default": ADAPTER_BYPASS,
-                    "tooltip": "Only affects LoRAs that cannot fold into the low-rank branch "
-                               "(LoKr, LoHa, OFT); a plain LoRA is free either way. 'bypass' "
-                               "computes the adapter every forward and never touches the "
-                               "4-bit weight. 'bake' hands it to ComfyUI, which rewrites the "
-                               "weight once: no per-step cost, but the delta is quantized to "
-                               "4 bits with it. Measured with a LoKr at 1440x1920: bypass "
-                               "+1.8 s per model call, bake +0.",
+                    "tooltip": "Only affects LoRAs that cannot fold directly into the low-rank "
+                               "branch (LoKr, LoHa, OFT); a plain LoRA is free in all modes. "
+                               "'bypass' computes the adapter every forward without touching "
+                               "the 4-bit weight. 'svd delta' decomposes the delta into low-rank "
+                               "factors (zero per-step overhead). 'bake' rewrites the weight once: "
+                               "fast, but quantizes the delta to 4 bits.",
                 }),
             },
         }
