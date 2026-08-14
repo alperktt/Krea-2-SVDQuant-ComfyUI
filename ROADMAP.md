@@ -138,6 +138,87 @@ above the items that have been.
 paired benchmark** (README says so). `tools/fidelity_bench.py --variant base` already
 supports it. Not a quality lever — a claim with no evidence behind it.
 
+## 7. All-in-one checkpoint: diffusion + text encoder + VAE in one file
+
+**Status:** not started. The largest item here and the last one on the list for that reason —
+high value, high effort, and it needs a measurement it has never had.
+
+Today a working setup is three downloads that have to match: a 9.10 GB checkpoint, a 5.24 GB
+FP8 text encoder, a 0.51 GB VAE. Picking the wrong encoder is the most common first-run
+failure after picking the wrong loader node. One file removes the whole class of mistake, and
+quantizing the text encoder to 4 bits is where the remaining size is.
+
+**ComfyUI already supports this, which is the surprise.** `class Krea2` in
+`comfy/supported_models.py` defines `vae_key_prefix = ["vae."]` and
+`text_encoder_key_prefix = ["text_encoders."]`, and its `clip_target()` runs `llama_detect`
+over `text_encoders.qwen3vl_4b.transformer.`, which resolves to
+`comfy.utils.detect_layer_quantization` — a check for `.comfy_quant` markers that is entirely
+format-agnostic. Any layer we quantize with the machinery already in `quantize_krea2.py`
+switches the encoder onto `mixed_ops` and loads. So a **branchless** all-in-one file
+(`--format w4a4` or `int8`) needs no ComfyUI change and no node from this repo: it loads with
+the stock `CheckpointLoaderSimple`.
+
+An **svdq** all-in-one does need a node, because the `svdq_l1`/`svdq_l2` buffers have to be
+popped and attached the way `load_svdquant_w4a4` does. That is a wrapper around
+`comfy.sd.load_state_dict_guess_config`, not new mechanism.
+
+### The size arithmetic
+
+Measured file sizes, not estimates, except where marked:
+
+| component | today | all-in-one target |
+|---|---|---|
+| diffusion | 9.78 GB (svdq rank 256) | 8.48 GB (rank 64) or 8.05 GB (noLowRank) |
+| text encoder | 5.24 GB (`qwen3vl_4b_fp8_scaled`) | ~3.3 GB at 4-bit *(estimated)* |
+| VAE | 0.51 GB | 0.51 GB, unquantized |
+| **total** | **15.5 GB across 3 files** | **~11.9–12.3 GB in 1 file** |
+
+The 4-bit encoder estimate scales the BF16 encoder (8.88 GB) by the ratio the diffusion model
+gets (24 GB → 8.05 GB, ~34%), and is the number most likely to be wrong: a 4B LLM spends a much
+larger share of itself on embeddings than a DiT does, and embeddings do not quantize here.
+
+Note what this does **not** buy: the text encoder and the diffusion model are never resident at
+the same time — ComfyUI encodes, unloads, then samples. So this is a disk, download and
+correctness win, and a VRAM win during the encode pass only. Sampling speed and sampling VRAM
+do not move. Worth saying out loud before anyone reads "12 GB instead of 15.5 GB" as a VRAM
+figure.
+
+### What has to be built
+
+1. **A second layer set.** `_QUANT_SUFFIXES` targets `blocks.N.{attn,mlp}.*`, which is the DiT.
+   The encoder is a Qwen3 LLM: `layers.N.self_attn.{q,k,v,o}_proj`,
+   `layers.N.mlp.{gate,up,down}_proj`. `is_target` has to take the set rather than close over
+   one.
+2. **Leave the vision tower alone**, at least at first. Qwen3-VL carries one, krea2edit's image
+   conditioning path may use it, and quantizing something to find out whether it is dead weight
+   is the wrong order of operations.
+3. **A combiner**, streaming three state dicts into one with the prefixes above. The BF16 source
+   is 24 GB and the encoder another 8.88 GB, so it has to stream the way `convert()` already
+   does rather than build the dict in memory.
+4. **An svdq checkpoint loader node**, if the svdq variant is wanted.
+
+### The risk, and how to measure it
+
+4-bit is a much bigger ask of an LLM than of this DiT. The DiT tolerates it because convrot
+spreads the outliers and the low-rank branch absorbs what is left; LLM activations have
+outlier channels severe enough that a whole literature (SmoothQuant, AWQ) exists about them.
+INT8 is not an alternative — it is the same byte count as the FP8 encoder we already ship, so
+4-bit is the only setting that changes the number.
+
+Failure will not look like noise. It will look like **prompt adherence quietly getting worse**:
+a dropped clause, a colour that drifts, a count that stops being respected. That is exactly the
+kind of regression the existing harness catches, because it is measured against a BF16
+reference at fixed seeds — hold the diffusion model constant, swap only the encoder, and run
+`tools/fidelity_bench.py`. The dense-text and counting prompts in the benchmark set are the
+ones to read first.
+
+Act-aware calibration on the encoder is the natural follow-up if plain 4-bit is close but not
+close enough. It needs its own capture: the hooks would ride on `CLIPTextEncode`, not on the
+sampler, so `svdquant_capture.py` needs a second pair of nodes rather than a flag. Do not build
+that before the plain 4-bit measurement says whether it is needed.
+
+---
+
 ---
 
 ## Measured and rejected — do not redo these
