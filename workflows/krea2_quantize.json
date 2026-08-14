@@ -1,0 +1,126 @@
+{
+  "id": "00000000-0000-4000-8000-000000000000",
+  "revision": 0,
+  "last_node_id": 3,
+  "last_link_id": 0,
+  "nodes": [
+    {
+      "id": 1,
+      "type": "Note",
+      "pos": [
+        60,
+        60
+      ],
+      "size": [
+        460,
+        1360
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [],
+      "properties": {
+        "Node name for S&R": "Note"
+      },
+      "widgets_values": [
+        "MAKE YOUR OWN QUANTIZED CHECKPOINT - no terminal needed\n\nThis graph is the whole quantizer. Set the widgets, press Queue,\nwait. It does exactly what `python quantize_krea2.py` does (same\nfunction, not a copy), and writes the result next to the source in\nComfyUI/models/diffusion_models/.\n\nBEFORE YOU START\n- You need the BF16 Krea 2 checkpoint (~24 GB) in\n  ComfyUI/models/diffusion_models/. FP8 also works as a source; any\n  other already-quantized file does not.\n- ~12 GB free on that drive. The output is ~8 GB.\n- Run the Env Check node first (it needs nothing wired). If it says\n  the cuda backend is not live, the file you are about to build will\n  run SLOWER than fp8 - fix torch before spending the disk.\n\nWHICH FORMAT\n  svdq  4-bit + a low-rank bf16 correction branch. Best quality of\n        the 4-bit options. Loads with the Krea2 SVDQuant W4A4 Loader.\n  w4a4  same without the branch. Smaller, ~9% faster per step.\n  int8  most faithful, still ~2x fp8 on Ampere. Stock UNETLoader.\n  fp8   storage only, no speedup here.\n  w4a4 / int8 / fp8 ignore rank, rank_alloc and refine_iters.\n\nWHICH RANK (svdq only)\n  No LoRA planned -> 64. 128 and 256 measured the same.\n  LoRAs planned  -> 256. It wins clearly there; 64 loses most of\n                    its advantage once a LoRA is patched in.\n  Keep refine_iters at 100. At 0 the split is single-shot (~54s\n  instead of ~5.7min) and raising rank then buys nothing.\n\nWHAT TO EXPECT WHILE IT RUNS\n- The queue is BLOCKED. Nothing else generates. 54s to ~6 min.\n- Every loaded model is unloaded first, so your next generation\n  pays a reload. This is deliberate: the dequantize step needs the\n  card to itself or it OOMs.\n- overwrite is off on purpose. An existing file of the same name is\n  an error, not 8 GB written over last night's run.\n\nThe summary appears on the node when it finishes, and says which\nloader to use and what sampler settings that variant wants.\n\nFREE QUALITY: FILL IN act_stats (svdq only)\nDownload the calibration file for your variant from\nhuggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI/tree/main/calibration\ninto ComfyUI/output/, then type its name into act_stats:\n\n  Turbo -> krea2_act_stats.safetensors\n  base  -> krea2_act_stats_base.safetensors\n\n6.67 MB each. They fit the low-rank branch against activations\nmeasured from a real sampling pass instead of assuming every input\nchannel matters equally. LPIPS to BF16 0.3378 -> 0.2825 at rank 64.\nSame rank, same file size, same kernel, same speed. There is no\nreason to skip this.\n\nTake the file that matches the model you are quantizing. A mismatch\nis caught before any GPU work only if the layer NAMES differ, and\nTurbo and base share their names - so the check will not save you\nfrom feeding Turbo's statistics to a base build. Read the filename.\n\nIf you are quantizing a finetune, a merge, or anything these two\nfiles do not describe, capture your own:\nworkflows/krea2_quantize_calibrated.json does the capture and the\nquantize in one Queue press."
+      ],
+      "title": "READ ME FIRST",
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 2,
+      "type": "Krea2SVDQuantEnvCheck",
+      "pos": [
+        480,
+        60
+      ],
+      "size": [
+        420,
+        120
+      ],
+      "flags": {},
+      "order": 1,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "report",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Krea2SVDQuantEnvCheck"
+      },
+      "widgets_values": [],
+      "title": "1. Env Check - run this first, it needs nothing",
+      "color": "#432",
+      "bgcolor": "#653"
+    },
+    {
+      "id": 3,
+      "type": "Krea2SVDQuantQuantize",
+      "pos": [
+        480,
+        240.0
+      ],
+      "size": [
+        420,
+        460
+      ],
+      "flags": {},
+      "order": 2,
+      "mode": 0,
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "summary",
+          "type": "STRING",
+          "links": [],
+          "slot_index": 0
+        }
+      ],
+      "properties": {
+        "Node name for S&R": "Krea2SVDQuantQuantize"
+      },
+      "widgets_values": [
+        "krea2_bf16.safetensors",
+        "svdq",
+        64,
+        "uniform",
+        100,
+        256,
+        "turbo",
+        "",
+        false,
+        "",
+        0
+      ],
+      "title": "2. Quantize - set source_model and act_stats, then Queue",
+      "color": "#233",
+      "bgcolor": "#355"
+    }
+  ],
+  "links": [],
+  "groups": [
+    {
+      "title": "Quantize",
+      "bounding": [
+        500,
+        20,
+        460,
+        640
+      ],
+      "color": "#8a4",
+      "font_size": 24,
+      "flags": {}
+    }
+  ],
+  "config": {},
+  "extra": {},
+  "version": 0.4
+}

@@ -1,0 +1,139 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": {
+      "unet_name": "krea2_bf16.safetensors",
+      "weight_dtype": "default"
+    },
+    "_meta": {
+      "title": "BF16 source (stock loader)"
+    }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": {
+      "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+      "type": "krea2",
+      "device": "default"
+    },
+    "_meta": {
+      "title": "Text encoder (Qwen3-VL 4B)"
+    }
+  },
+  "3": {
+    "class_type": "Krea2SVDQuantCaptureStart",
+    "inputs": {
+      "reset": true,
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Capture Start - before the sampler"
+    }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "A cluttered antique clockmaker's workshop seen through a cracked magnifying glass, brass gears laid out in a spiral on the workbench, a ginger cat asleep on a stack of leather-bound books, warm afternoon light with visible dust motes, photorealistic, 85mm lens, shallow depth of field",
+      "clip": [
+        "2",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Calibration prompt"
+    }
+  },
+  "5": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "blurry, low resolution, jpeg artifacts, watermark, deformed, extra limbs",
+      "clip": [
+        "2",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Negative (Turbo: replace with ConditioningZeroOut)"
+    }
+  },
+  "6": {
+    "class_type": "EmptySD3LatentImage",
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "_meta": {
+      "title": "Latent 1024x1024"
+    }
+  },
+  "7": {
+    "class_type": "KSampler",
+    "inputs": {
+      "seed": 987654321,
+      "steps": 20,
+      "cfg": 3.5,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1.0,
+      "model": [
+        "3",
+        0
+      ],
+      "positive": [
+        "4",
+        0
+      ],
+      "negative": [
+        "5",
+        0
+      ],
+      "latent_image": [
+        "6",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Calibration pass - base 20/3.5, Turbo 8/1.0"
+    }
+  },
+  "8": {
+    "class_type": "Krea2SVDQuantCaptureSave",
+    "inputs": {
+      "filename": "krea2_act_stats.safetensors",
+      "keep_capturing": false,
+      "latent": [
+        "7",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Capture Save - after the sampler"
+    }
+  },
+  "9": {
+    "class_type": "Krea2SVDQuantQuantize",
+    "inputs": {
+      "source_model": "krea2_bf16.safetensors",
+      "format": "svdq",
+      "rank": 64,
+      "rank_alloc": "uniform",
+      "refine_iters": 100,
+      "groupsize": 256,
+      "variant": "turbo",
+      "output_name": "",
+      "overwrite": false,
+      "act_stats": [
+        "8",
+        2
+      ],
+      "seed": 0
+    },
+    "_meta": {
+      "title": "Quantize - source_model must match the loader above"
+    }
+  }
+}

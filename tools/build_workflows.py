@@ -61,7 +61,7 @@ class Graph:
         self._api = {}     # node_id -> what the API dialect needs about that node
 
     def add(self, class_type, col, row, inputs=None, outputs=None, widgets=None,
-            title=None, colour=None, size=None, api=True, mode=0):
+            title=None, colour=None, size=None, api=True, mode=0, widget_inputs=()):
         """`widgets` is a list of (input_name, value).
 
         The name is what the API dialect needs and the UI dialect ignores; `None` marks a
@@ -75,6 +75,10 @@ class Graph:
         `mode=4` mutes the node in the editor. A muted node must also be `api=False` -- the
         API dialect has no mute flag, so leaving it in would execute something the editor
         shows as off.
+
+        `widget_inputs` names inputs that are widgets on the node class but are being wired
+        from another node instead. LiteGraph needs the `widget` key on the slot or the editor
+        draws a plain input the frontend then refuses to reconnect to its widget.
         """
         if mode == 4 and api:
             raise ValueError("a muted node must be api=False: {}".format(class_type))
@@ -95,7 +99,9 @@ class Graph:
             "flags": {},
             "order": self._next_node - 2,
             "mode": mode,
-            "inputs": [{"name": n, "type": t, "link": None} for n, t in inputs],
+            "inputs": [dict({"name": n, "type": t, "link": None},
+                            **({"widget": {"name": n}} if n in widget_inputs else {}))
+                       for n, t in inputs],
             "outputs": [{"name": n, "type": t, "links": [], "slot_index": i}
                         for i, (n, t) in enumerate(outputs)],
             "properties": {"Node name for S&R": class_type},
@@ -571,6 +577,220 @@ def _check_adapter_constant():
     raise SystemExit("could not find ADAPTER_BYPASS in " + src)
 
 
+QUANTIZE_NOTE = """MAKE YOUR OWN QUANTIZED CHECKPOINT - no terminal needed
+
+This graph is the whole quantizer. Set the widgets, press Queue,
+wait. It does exactly what `python quantize_krea2.py` does (same
+function, not a copy), and writes the result next to the source in
+ComfyUI/models/diffusion_models/.
+
+BEFORE YOU START
+- You need the BF16 Krea 2 checkpoint (~24 GB) in
+  ComfyUI/models/diffusion_models/. FP8 also works as a source; any
+  other already-quantized file does not.
+- ~12 GB free on that drive. The output is ~8 GB.
+- Run the Env Check node first (it needs nothing wired). If it says
+  the cuda backend is not live, the file you are about to build will
+  run SLOWER than fp8 - fix torch before spending the disk.
+
+WHICH FORMAT
+  svdq  4-bit + a low-rank bf16 correction branch. Best quality of
+        the 4-bit options. Loads with the Krea2 SVDQuant W4A4 Loader.
+  w4a4  same without the branch. Smaller, ~9% faster per step.
+  int8  most faithful, still ~2x fp8 on Ampere. Stock UNETLoader.
+  fp8   storage only, no speedup here.
+  w4a4 / int8 / fp8 ignore rank, rank_alloc and refine_iters.
+
+WHICH RANK (svdq only)
+  No LoRA planned -> 64. 128 and 256 measured the same.
+  LoRAs planned  -> 256. It wins clearly there; 64 loses most of
+                    its advantage once a LoRA is patched in.
+  Keep refine_iters at 100. At 0 the split is single-shot (~54s
+  instead of ~5.7min) and raising rank then buys nothing.
+
+WHAT TO EXPECT WHILE IT RUNS
+- The queue is BLOCKED. Nothing else generates. 54s to ~6 min.
+- Every loaded model is unloaded first, so your next generation
+  pays a reload. This is deliberate: the dequantize step needs the
+  card to itself or it OOMs.
+- overwrite is off on purpose. An existing file of the same name is
+  an error, not 8 GB written over last night's run.
+
+The summary appears on the node when it finishes, and says which
+loader to use and what sampler settings that variant wants.
+
+FREE QUALITY: FILL IN act_stats (svdq only)
+Download the calibration file for your variant from
+huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI/tree/main/calibration
+into ComfyUI/output/, then type its name into act_stats:
+
+  Turbo -> krea2_act_stats.safetensors
+  base  -> krea2_act_stats_base.safetensors
+
+6.67 MB each. They fit the low-rank branch against activations
+measured from a real sampling pass instead of assuming every input
+channel matters equally. LPIPS to BF16 0.3378 -> 0.2825 at rank 64.
+Same rank, same file size, same kernel, same speed. There is no
+reason to skip this.
+
+Take the file that matches the model you are quantizing. A mismatch
+is caught before any GPU work only if the layer NAMES differ, and
+Turbo and base share their names - so the check will not save you
+from feeding Turbo's statistics to a base build. Read the filename.
+
+If you are quantizing a finetune, a merge, or anything these two
+files do not describe, capture your own:
+workflows/krea2_quantize_calibrated.json does the capture and the
+quantize in one Queue press."""
+
+CALIB_NOTE = """CALIBRATED QUANTIZE - measure your own activations
+
+YOU PROBABLY DO NOT NEED THIS GRAPH.
+Calibration files for stock Krea 2 Turbo and base are published at
+huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI/tree/main/calibration
+- 6.67 MB each. Download the one matching your variant, drop it in
+ComfyUI/output/, name it in the act_stats box of the plain
+krea2_quantize.json graph, and you get the identical quality lever
+without running a sampling pass.
+
+This graph is for the case those files do not cover: a finetune, a
+merge, a model whose weights are not the released ones. Activation
+statistics describe the WEIGHTS they were captured from. Same
+architecture is not the same model - Turbo's file loads cleanly into
+a base build and quietly describes the wrong thing.
+
+WHAT IT BUYS
+The low-rank branch is fitted against activations measured from a
+real sampling pass instead of assuming every input channel matters
+equally. Measured, no LoRA, rank 64: LPIPS to BF16 0.3378 -> 0.2825.
+Same rank, same file size, same kernel, same speed.
+
+WHAT RUNS, IN ORDER
+1. The BF16 model is loaded with the stock UNETLoader and sampled
+   once. Capture Start hooks every layer that will be quantized and
+   records the RMS of its inputs; Capture Save writes them out.
+2. Capture Save's act_stats_path feeds the Quantize node. That wire
+   is not cosmetic - it is what stops ComfyUI running the quantizer
+   first, which would silently produce an uncalibrated file.
+
+So one Queue press does calibration AND quantization. Expect the
+sampling pass plus 54s-6min of quantizing, with the queue blocked.
+
+SET THIS BEFORE YOU RUN
+- UNETLoader: the BF16 checkpoint. Statistics from an already
+  quantized model describe the wrong thing.
+- Quantize node: the SAME file as source_model. It is a separate
+  dropdown, and no, it cannot be wired - the loader hands over a
+  MODEL object, not a filename.
+- variant: turbo or base, so the output gets the right name.
+- KSampler: 20 steps / cfg 3.5 suits base. For Turbo use 8 steps
+  and cfg 1.0, and swap the negative prompt for ConditioningZeroOut.
+
+CALIBRATING ON SEVERAL PROMPTS (better, optional)
+The defaults calibrate on one prompt, which is enough to beat no
+calibration. To use more: set keep_capturing = true on Capture Save,
+mute the Quantize node (select it, Ctrl+M), queue as many prompts as
+you like with reset = false on Capture Start after the first, then
+unmute Quantize and queue once more. Prompts should look like what
+you actually generate.
+
+Only svdq uses act_stats. The other formats have no branch to fit,
+and wiring act_stats into them is an error rather than a no-op."""
+
+
+def build_quantize():
+    g = Graph()
+    g.note(QUANTIZE_NOTE, 0, 0, size=(460, 1360), title="READ ME FIRST")
+
+    g.add("Krea2SVDQuantEnvCheck", 1, 0, outputs=[("report", "STRING")],
+          title="1. Env Check - run this first, it needs nothing", colour=YELLOW,
+          size=[420, 120])
+    g.add("Krea2SVDQuantQuantize", 1, 0.9,
+                  outputs=[("summary", "STRING")],
+                  widgets=[("source_model", "krea2_bf16.safetensors"), ("format", "svdq"),
+                           ("rank", 64), ("rank_alloc", "uniform"), ("refine_iters", 100),
+                           ("groupsize", 256), ("variant", "turbo"), ("output_name", ""),
+                           ("overwrite", False), ("act_stats", ""), ("seed", 0)],
+          title="2. Quantize - set source_model and act_stats, then Queue", colour=TEAL,
+          size=[420, 460])
+
+    groups = [g.group("Quantize", (500, 20, 460, 640), colour="#8a4")]
+    return g.serialize(groups), g.serialize_api()
+
+
+def build_quantize_calibrated():
+    g = Graph()
+    g.note(CALIB_NOTE, 0, 0, size=(460, 1420), title="READ ME FIRST")
+
+    unet = g.add("UNETLoader", 1, 0, outputs=[("MODEL", "MODEL")],
+                 widgets=[("unet_name", "krea2_bf16.safetensors"),
+                          ("weight_dtype", "default")],
+                 title="BF16 source (stock loader)", colour=TEAL, size=[400, 120])
+    clip = g.add("CLIPLoader", 1, 1, outputs=[("CLIP", "CLIP")],
+                 widgets=[("clip_name", "qwen3vl_4b_fp8_scaled.safetensors"), ("type", "krea2"),
+                          ("device", "default")],
+                 title="Text encoder (Qwen3-VL 4B)", colour=TEAL, size=[400, 120])
+
+    start = g.add("Krea2SVDQuantCaptureStart", 2, 0, inputs=[("model", "MODEL")],
+                  outputs=[("model", "MODEL"), ("status", "STRING")],
+                  widgets=[("reset", True)],
+                  title="Capture Start - before the sampler", colour=GREEN, size=[400, 100])
+    pos = g.add("CLIPTextEncode", 2, 0.8, inputs=[("clip", "CLIP")],
+                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[("text", PROMPT)],
+                title="Calibration prompt", colour=GREEN, size=[400, 200])
+    neg = g.add("CLIPTextEncode", 2, 2.0, inputs=[("clip", "CLIP")],
+                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[("text", NEGATIVE)],
+                title="Negative (Turbo: replace with ConditioningZeroOut)", colour=GREEN,
+                size=[400, 140])
+    latent = g.add("EmptySD3LatentImage", 2, 3.0, outputs=[("LATENT", "LATENT")],
+                   widgets=[("width", 1024), ("height", 1024), ("batch_size", 1)],
+                   title="Latent 1024x1024", colour=GREEN, size=[400, 120])
+
+    sampler = g.add("KSampler", 3, 0,
+                    inputs=[("model", "MODEL"), ("positive", "CONDITIONING"),
+                            ("negative", "CONDITIONING"), ("latent_image", "LATENT")],
+                    outputs=[("LATENT", "LATENT")],
+                    widgets=[("seed", 987654321), (None, "randomize"), ("steps", 20),
+                             ("cfg", 3.5), ("sampler_name", "euler"), ("scheduler", "simple"),
+                             ("denoise", 1.0)],
+                    title="Calibration pass - base 20/3.5, Turbo 8/1.0", colour=PURPLE,
+                    size=[400, 280])
+
+    save = g.add("Krea2SVDQuantCaptureSave", 4, 0, inputs=[("latent", "LATENT")],
+                 outputs=[("latent", "LATENT"), ("status", "STRING"),
+                          ("act_stats_path", "STRING")],
+                 widgets=[("filename", "krea2_act_stats.safetensors"),
+                          ("keep_capturing", False)],
+                 title="Capture Save - after the sampler", colour=GREEN, size=[400, 120])
+
+    quant = g.add("Krea2SVDQuantQuantize", 5, 0,
+                  inputs=[("act_stats", "STRING")],
+                  outputs=[("summary", "STRING")],
+                  widgets=[("source_model", "krea2_bf16.safetensors"), ("format", "svdq"),
+                           ("rank", 64), ("rank_alloc", "uniform"), ("refine_iters", 100),
+                           ("groupsize", 256), ("variant", "turbo"), ("output_name", ""),
+                           ("overwrite", False), ("act_stats", ""), ("seed", 0)],
+                  title="Quantize - source_model must match the loader above", colour=TEAL,
+                  size=[420, 440], widget_inputs=("act_stats",))
+
+    g.link(unet, "MODEL", start, "model")
+    g.link(start, "model", sampler, "model")
+    g.link(clip, "CLIP", pos, "clip")
+    g.link(clip, "CLIP", neg, "clip")
+    g.link(pos, "CONDITIONING", sampler, "positive")
+    g.link(neg, "CONDITIONING", sampler, "negative")
+    g.link(latent, "LATENT", sampler, "latent_image")
+    g.link(sampler, "LATENT", save, "latent")
+    g.link(save, "act_stats_path", quant, "act_stats")
+
+    groups = [
+        g.group("Load BF16", (500, 20, 420, 420)),
+        g.group("Calibration pass", (940, 20, 420, 800)),
+        g.group("Quantize", (2200, 20, 460, 520), colour="#8a4"),
+    ]
+    return g.serialize(groups), g.serialize_api()
+
+
 def _write(path, payload):
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         json.dump(payload, fh, indent=2, ensure_ascii=False)
@@ -583,7 +803,9 @@ def main():
     for name, build in (("krea2_turbo_svdquant_w4a4_t2i", build_turbo),
                         ("krea2_base_svdquant_w4a4_t2i", build_base),
                         ("krea2_turbo_svdquant_w4a4_lora", build_lora),
-                        ("krea2_svdquant_diagnostics", build_diagnostics)):
+                        ("krea2_svdquant_diagnostics", build_diagnostics),
+                        ("krea2_quantize", build_quantize),
+                        ("krea2_quantize_calibrated", build_quantize_calibrated)):
         graph, api = build()
         ui_path = os.path.join(OUT_DIR, name + ".json")
         api_path = os.path.join(OUT_DIR, name + "_api.json")

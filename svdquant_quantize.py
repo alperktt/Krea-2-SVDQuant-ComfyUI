@@ -116,8 +116,63 @@ class Krea2SVDQuantQuantize:
                                "inference and the best-measured setting here - LPIPS to BF16 "
                                "0.3378 to 0.2825 with no LoRA. Empty means the plain objective.",
                 }),
+                # Appended after act_stats rather than inserted among the required inputs:
+                # ComfyUI matches widgets_values positionally, so anywhere else would shift
+                # every value in a workflow saved before this input existed.
+                "seed": ("INT", {
+                    "default": 0, "min": -1, "max": 0xFFFFFFFF,
+                    "tooltip": "svdq only: seed for the randomized low-rank SVD. Quantizing "
+                               "twice with the same seed on the same GPU now gives identical "
+                               "files; -1 restores the old unseeded behaviour, where it did "
+                               "not. The same seed on a different device still differs (~1e-4 "
+                               "per weight) - CPU and CUDA do not draw the same numbers.",
+                }),
             },
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, source_model, format, variant, rank, rank_alloc, output_name,
+                        overwrite):
+        """Refuse the obviously-doomed run before the graph starts, not after.
+
+        Everything checked here is a widget, so ComfyUI has it at validation time. That
+        matters most in the calibrated graph, where this node sits behind a full sampling
+        pass: without this, "that file already exists" arrives several minutes after you
+        pressed Queue, having burned the calibration run to tell you.
+
+        Deliberately not checked here: `act_stats`, which can be wired from the Capture Save
+        node and therefore has no value yet at validation time. Its checks stay in `run`.
+        """
+        try:
+            src = folder_paths.get_full_path_or_raise("diffusion_models", source_model)
+        except Exception as exc:
+            return str(exc)
+        try:
+            _, rank = resolve_format(format, rank, rank_was_set=False)
+        except Exception as exc:
+            return str(exc)
+
+        if output_name.strip():
+            name = output_name.strip()
+            if not name.endswith(".safetensors"):
+                name += ".safetensors"
+            dst = os.path.join(os.path.dirname(src), name)
+        else:
+            # An act-aware build lands on a different filename, and act_stats is unknowable
+            # here. Pass None and the check is against the un-tagged name: it can miss a
+            # collision, never invent one, which is the right way for a pre-flight check to
+            # be wrong.
+            dst, _note = derive_out_path(src, format, rank, variant, rank_alloc, None)
+
+        if os.path.exists(dst) and not overwrite:
+            return ("{} already exists. Enable 'overwrite', or set a different output_name."
+                    .format(dst))
+        free = _free_bytes(dst)
+        if free < _MIN_FREE_BYTES:
+            return ("only {:.1f} GB free on the drive holding {}; quantizing needs roughly "
+                    "{:.0f} GB of headroom.".format(free / 1024 ** 3, os.path.dirname(dst),
+                                                    _MIN_FREE_BYTES / 1024 ** 3))
+        return True
 
     @classmethod
     def IS_CHANGED(cls, *args, **kwargs):
@@ -139,7 +194,7 @@ class Krea2SVDQuantQuantize:
                    "Krea2 SVDQuant W4A4 Loader (svdq) or the stock UNETLoader (w4a4/int8/fp8).")
 
     def run(self, source_model, format, rank, rank_alloc, refine_iters, groupsize, variant,
-            output_name, overwrite, act_stats=""):
+            output_name, overwrite, act_stats="", seed=0):
         src = folder_paths.get_full_path_or_raise("diffusion_models", source_model)
 
         # `rank` always carries a value from the widget, so "was it set?" cannot be inferred
@@ -196,12 +251,13 @@ class Krea2SVDQuantQuantize:
             pbar.update_absolute(done, total)
 
         logging.info("[krea2-svdquant] quantizing %s -> %s (format %s, rank %s/%s, "
-                     "refine_iters %s, act_stats %s)", src, dst, fmt, rank, rank_alloc,
-                     refine_iters if rank else 0, stats_path or "none")
+                     "refine_iters %s, act_stats %s, seed %s)", src, dst, fmt, rank,
+                     rank_alloc, refine_iters if rank else 0, stats_path or "none",
+                     "unseeded" if seed < 0 else seed)
         summary = convert(src, dst, fmt, groupsize, "cuda", rank, refine_iters,
                           variant=variant, progress_cb=progress,
                           rank_alloc=rank_alloc if rank else "uniform",
-                          act_stats=stats_path)
+                          act_stats=stats_path, seed=None if seed < 0 else int(seed))
 
         hint = SAMPLER_HINTS.get(variant)
         loader = ("Krea2 SVDQuant W4A4 Loader" if rank else "the stock UNETLoader")

@@ -96,6 +96,10 @@ with safe_open("Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors", framewo
    - `krea2_svdquant_diagnostics.json` → **run this first if anything is slow or broken.**
      Generates no image; the Env Check node in it needs no model, so you can run it before
      downloading 8 GB.
+   - `krea2_quantize.json` → **build your own checkpoint**, no terminal: pick a format and a
+     rank, press Queue. See [Build your own checkpoint](#build-your-own-checkpoint).
+   - `krea2_quantize_calibrated.json` → only if you are quantizing something other than the
+     released weights; for those, download a ready-made calibration file instead.
 
    Any `SVDQuant-W4A4-rank*` file needs the **Krea2 SVDQuant W4A4 Loader** node from this repo;
    `noLowRank` uses the stock **UNETLoader**. The `*_api.json` files are for POSTing to
@@ -220,6 +224,31 @@ is **API format** (POST to `/prompt`, no layout). Both come out of `build_workfl
 
 ## Build your own checkpoint
 
+**Without a terminal.** Drag `workflows/krea2_quantize.json` in, point `source_model` at your
+BF16 checkpoint, press Queue. Every widget carries a tooltip and the note on the left covers
+the choices that matter (which format, which rank, how much disk).
+
+Fill in `act_stats` while you are there — it is the cheapest quality you will get here and you
+do not have to measure anything for it. Download the file matching your variant from
+[`calibration/`](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI/tree/main/calibration)
+(6.67 MB) into `ComfyUI/output/` and type its name in: `krea2_act_stats.safetensors` for Turbo,
+`krea2_act_stats_base.safetensors` for base.
+
+**You only need to capture your own statistics for weights those files do not describe** — a
+finetune, a merge, anything that is not the released checkpoint. Activation statistics describe
+the weights they came from, and sharing an architecture is not enough: Turbo's file loads into a
+base build without complaint and then describes the wrong model. `check_act_stats_coverage`
+catches a genuinely foreign model before any GPU work, but it matches on layer *names*, which
+Turbo and base share — so it cannot catch that particular mistake for you. For that case,
+`workflows/krea2_quantize_calibrated.json` runs the capture and the quantize in one Queue press:
+the Capture Save node's `act_stats_path` output feeds the Quantize node, and that wire is also
+what guarantees the calibration runs *first* — without it ComfyUI is free to quantize before
+sampling and you get an uncalibrated file with no warning.
+
+Three things to know before you press Queue, in either graph: it blocks the queue for the
+whole run (54 s to ~6 min), it unloads any resident model to take the GPU, and it writes ~8 GB
+(refusing rather than overwriting unless you tick `overwrite`).
+
 From a terminal:
 
 ```bash
@@ -234,9 +263,16 @@ python quantize_krea2.py /path/to/krea2_bf16.safetensors --format svdq --rank 25
 the metadata — it does not change the quantization, since layer selection keys off block
 naming that Turbo and base share.
 
-Or use the **Krea2 SVDQuant Quantize** node, which calls the same code. Three things first: it
-blocks the queue for the whole run, it unloads any resident model to take the GPU, and it
-writes ~8 GB (refusing rather than overwriting unless you tick `overwrite`).
+The **Krea2 SVDQuant Quantize** node calls this same function — the CLI and the graph are one
+quantizer, not two that drift.
+
+**Builds are reproducible, per device.** The low-rank split is a *randomized* SVD, so before
+`--seed` existed two runs of the same command on the same GPU produced different checkpoints —
+around 1e-4 per weight, which a sampler then compounds over 8–50 steps into a visibly different
+image. The seed defaults to `0`; pass `--seed -1` (or `-1` in the node) for the old behaviour.
+Across devices it still differs whatever the seed: CPU and CUDA neither draw the same numbers
+nor reduce their GEMMs in the same order. Both the seed and the build device are recorded in
+the checkpoint metadata (`krea2_svdquant_seed`, `krea2_svdquant_device`).
 
 **`rank` and `refine_iters` are one lever, not two.** With refinement off a rank sweep is flat
 — rank 16 and rank 256 land within noise of each other — so raising rank without

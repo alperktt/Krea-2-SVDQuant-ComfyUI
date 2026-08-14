@@ -228,9 +228,14 @@ class Krea2SVDQuantCaptureSave:
             }
         }
 
-    RETURN_TYPES = ("LATENT", "STRING")
-    RETURN_NAMES = ("latent", "status")
-    OUTPUT_TOOLTIPS = ("Passed through unchanged.", "Where the file went and what is in it.")
+    # `act_stats_path` is appended rather than inserted so workflows saved against the
+    # two-output version keep their links: slot indices 0 and 1 still mean what they did.
+    RETURN_TYPES = ("LATENT", "STRING", "STRING")
+    RETURN_NAMES = ("latent", "status", "act_stats_path")
+    OUTPUT_TOOLTIPS = ("Passed through unchanged.", "Where the file went and what is in it.",
+                       "Absolute path of the file just written. Wire it into the Quantize "
+                       "node's act_stats: that is also what forces the quantizer to run "
+                       "after the calibration pass rather than before it.")
     OUTPUT_NODE = True
     FUNCTION = "save"
     CATEGORY = _CATEGORY
@@ -251,7 +256,7 @@ class Krea2SVDQuantCaptureSave:
                   "tokens per layer: {min_tokens}-{max_tokens}{more}").format(
             more="" if keep_capturing else "\nhooks detached", **info)
         logging.info("[krea2-svdquant] %s", status.replace("\n", "  "))
-        return {"ui": {"text": [status]}, "result": (latent, status)}
+        return {"ui": {"text": [status]}, "result": (latent, status, info["path"])}
 
 
 NODE_CLASS_MAPPINGS = {

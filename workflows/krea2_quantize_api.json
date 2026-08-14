@@ -1,0 +1,28 @@
+{
+  "1": {
+    "class_type": "Krea2SVDQuantEnvCheck",
+    "inputs": {},
+    "_meta": {
+      "title": "1. Env Check - run this first, it needs nothing"
+    }
+  },
+  "2": {
+    "class_type": "Krea2SVDQuantQuantize",
+    "inputs": {
+      "source_model": "krea2_bf16.safetensors",
+      "format": "svdq",
+      "rank": 64,
+      "rank_alloc": "uniform",
+      "refine_iters": 100,
+      "groupsize": 256,
+      "variant": "turbo",
+      "output_name": "",
+      "overwrite": false,
+      "act_stats": "",
+      "seed": 0
+    },
+    "_meta": {
+      "title": "2. Quantize - set source_model and act_stats, then Queue"
+    }
+  }
+}
