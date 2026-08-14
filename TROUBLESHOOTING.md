@@ -122,6 +122,33 @@ locked pages aggressively — `MAX_PINNED_MEMORY` there is 40% of system RAM —
 routinely with a model this size. It is not specific to `svdq`; INT8 checkpoints trigger it
 too. The diagnostics node prints your pinned-memory budget under `mode=env`.
 
+## Iteration time jumps to 30-100 s once VRAM passes ~12 GB (and FP8/INT8 do not)
+
+Real, known, and not your setup. The `svdq` loader opts the model out of ComfyUI's dynamic VRAM
+management: `load_svdquant_w4a4` passes `disable_dynamic=True`, which pins the model to the
+classic `ModelPatcher`. The stock `UNETLoader` does not do that, so the FP8, INT8 and
+`noLowRank` checkpoints get the streaming patcher and the `svdq` ones do not. Past the point
+where the model no longer fits, the pinned path falls back to streaming weights per module per
+step, and a ~1 s iteration becomes 30-100 s.
+
+Two things make an svdq file cross that line earlier than a same-format file: the low-rank
+branch is real memory (~645 MB at rank 256, ~160 MB at rank 64) on top of the checkpoint, and
+the rank-256 build is 9.10 GB against 7.50 GB for `noLowRank`.
+
+On a 12 GB card, in order of preference:
+
+1. **`Krea2-Turbo-W4A4-noLowRank.safetensors`** (7.50 GB). Loads with the stock `UNETLoader`, so
+   it gets dynamic VRAM, and it is ~9% faster per step than any rank. You give up the low-rank
+   branch's fidelity.
+2. **`Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors`** (7.90 GB). 1.2 GB smaller than rank 256
+   and statistically identical to it *as long as you never load a LoRA*.
+3. Keep the resolution and batch size under whatever puts you over the edge, and watch the
+   loader's `model_size` line — it reports the real number, branch included.
+
+The pin is deliberate, not an oversight: the dynamic patcher takes ownership of the weights, and
+that path has never been validated against the branch buffers. Lifting it is
+[item 1 on the roadmap](ROADMAP.md), with the two conditions that have to hold first.
+
 ## Out of memory on a small card (and int8 works fine)
 
 Fixed. The low-rank factors were attached as non-persistent buffers, which ComfyUI's

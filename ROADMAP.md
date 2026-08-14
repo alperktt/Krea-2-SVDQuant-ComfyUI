@@ -9,7 +9,35 @@ down gets run twice.
 
 ---
 
-## 1. Act-aware at ranks other than 256
+## 1. Let the svdq loader use ComfyUI's dynamic patcher
+
+**Status:** reported from the field, cause identified, not fixed. The highest-value item here,
+because it is the difference between "works" and "unusable" on a 12 GB card.
+
+`load_svdquant_w4a4` passes `disable_dynamic=True`
+([svdquant_w4a4.py](svdquant_w4a4.py)), which pins the model to the classic `ModelPatcher` and
+opts it out of dynamic VRAM management. The stock `UNETLoader` does not, so the FP8, INT8 and
+`noLowRank` checkpoints get the streaming patcher and the `svdq` ones do not — which is exactly
+the asymmetry users report: past ~12 GB the svdq files fall to per-step weight streaming and
+iteration time goes from ~1 s to 30-100 s, while the branchless files of the same size are
+fine.
+
+The pin is deliberate and documented: `ModelPatcherDynamic` takes ownership of the weights via
+`load_model_weights(..., assign=patcher.is_dynamic())`, and that path has never been validated
+against the low-rank branch buffers. Two things have to hold before the flag can come off:
+
+1. The `svdq_l1`/`svdq_l2` buffers survive the streaming patcher's assignment and stay on the
+   device the layer's input is on, or `add_low_rank`'s `cast_to` starts copying ~2.9 MB per
+   layer per step.
+2. `module_size()` still counts them. That is what `_publish_in_state_dict` exists for, and a
+   patcher that builds its own size accounting may not go through `state_dict()` at all —
+   uncounted, they are ~645 MB at rank 256 that the VRAM budget believes is free.
+
+Until then the honest workaround for a 12 GB card is `Krea2-Turbo-W4A4-noLowRank` (7.50 GB,
+stock loader, ~9% faster per step) or the rank-64 build (7.90 GB), which measures the same as
+rank 256 as long as no LoRA is loaded.
+
+## 2. Act-aware at ranks other than 256
 
 **Status:** never tried. `--act-stats` shipped after the rank sweep was run, and only a
 rank-256 build was ever made. So "is act-aware rank 64 as good as act-aware rank 256" is
@@ -37,7 +65,7 @@ that rank 256 is "~4% slower than rank 16" — it is 8.2%.)
 
 **Cost:** two builds (~14 min each) plus a `base`-arm fidelity run (~25 min).
 
-## 2. Make `TorchCompileModel` work on branchless checkpoints
+## 3. Make `TorchCompileModel` work on branchless checkpoints
 
 **Status:** open bug, one failed attempt.
 
@@ -67,7 +95,7 @@ see whether Dynamo honours an instance-level `forward` on a *child* module in th
 That separates "Dynamo ignores instance patches on children" from "something in ComfyUI
 replaces the module".
 
-## 3. Fold LoKr/LoHa/OFT deltas into the low-rank branch by SVD
+## 4. Fold LoKr/LoHa/OFT deltas into the low-rank branch by SVD
 
 **Status:** idea, not started. Would become a third value for the LoRA node's `adapters`
 input, alongside `bypass` and `bake`.
@@ -98,13 +126,13 @@ low-rank, so this may need measuring per adapter); ~15 s of SVD at load across 2
 and whether the widened branch's VRAM is acceptable, given the branch is already 24% of a step
 at rank 256. Wants a fidelity run against `bypass` before it could become the default.
 
-## 4. Mixed precision: keep the first and last blocks at W8A8
+## 5. Mixed precision: keep the first and last blocks at W8A8
 
 **Status:** standard SVDQuant lever, never tried here. Costs file size, buys fidelity. No
 estimate — nothing has been measured, which is exactly why it is on this list rather than
 above the items that have been.
 
-## 5. Benchmark the base checkpoint
+## 6. Benchmark the base checkpoint
 
 `Krea2-Base-SVDQuant-W4A4-rank256-actaware` is published and has **never been through the
 paired benchmark** (README says so). `tools/fidelity_bench.py --variant base` already
