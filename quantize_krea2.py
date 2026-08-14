@@ -44,6 +44,7 @@ import math
 import os
 import sys
 import time
+import zlib
 
 __version__ = "0.2.0"
 
@@ -90,6 +91,12 @@ except Exception as exc:  # pragma: no cover - depends on the ComfyUI build
 # Relative improvement the refinement loop must keep making to earn another iteration. See
 # `svdquant_split` for the traced numbers this default comes from.
 REFINE_TOL = 0.001
+
+# Deterministic by default. The low-rank split is a *randomized* SVD, so an unseeded build is
+# irreproducible even on the same machine -- two files that differ by ~1e-4 per weight and by
+# a visibly different image after 8 steps of sampling. `None` restores the old ambient-RNG
+# behaviour for anyone who wants to sample the spread rather than pin it.
+DEFAULT_SEED = 0
 
 _QUANT_SUFFIXES = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo",
                    "mlp.gate", "mlp.up", "mlp.down")
@@ -304,6 +311,12 @@ def svd_lowrank(weight: torch.Tensor, rank: int, oversample: int = 16, niter: in
     few dozen singular directions matter here; `oversample` extra probe columns plus a
     couple of power iterations recover them to well past the precision 4-bit quantization
     cares about.
+
+    "Randomized" is load-bearing for reproducibility: `torch.svd_lowrank` draws its probe
+    matrix from the *ambient* RNG, so seeding is the caller's job (`svdquant_split` does it
+    per layer). Left unseeded, two runs of this script on the same GPU with identical
+    arguments produce different checkpoints -- close, but not equal, and visibly so once a
+    sampler amplifies them.
     """
     w = weight.float()
     min_dim = min(w.shape)
@@ -347,7 +360,7 @@ def _act_weighting(act_rms: torch.Tensor | None, in_features: int, device, floor
 
 def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
                    refine_iters: int = 100, act_rms: torch.Tensor | None = None,
-                   refine_tol: float = REFINE_TOL):
+                   refine_tol: float = REFINE_TOL, seed: int | None = None):
     """SVDQuant ordering: pull a low-rank bf16 branch out of W, quantize the residual.
 
     The low-rank branch absorbs the outlier-heavy directions, so the part that has to
@@ -384,9 +397,57 @@ def svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
     assumption a reasonable one. Closing the remaining gap to deepcompressor means
     measuring the real covariance, which is what makes their conversion take hours.
 
+    `seed` makes the run reproducible. The refinement draws a fresh random probe matrix on
+    every iteration through `svd_lowrank`, from the ambient RNG, so without this two builds
+    of the same checkpoint with the same arguments are merely *similar*: measured at ~1e-4
+    relative on the dequantized weights, which is small until a sampler spends 8-50 steps
+    compounding it and you get a visibly different image. Seeding once here rather than per
+    iteration is enough -- the whole sequence of draws then follows from one number. Pass
+    `None` for the old ambient-RNG behaviour.
+
+    Reproducibility is per device, not across devices: CPU and CUDA generate different
+    numbers from the same seed, and their GEMM reduction orders differ too, so a CPU build
+    and a GPU build of the same checkpoint will never be equal. `convert` records the device
+    in the metadata for that reason.
+
     Returns None for a degenerate weight (all-zero, or one that makes the error metric
     non-finite); the caller quantizes those without a branch rather than aborting.
     """
+    if seed is not None:
+        # fork_rng so a caller's RNG state survives: this runs inside somebody else's
+        # process (ComfyUI), where silently reseeding the global generator would make every
+        # later sampler node in the same session reproduce a different image.
+        with torch.random.fork_rng(devices=_rng_devices(weight.device)):
+            torch.manual_seed(seed)
+            return _svdquant_split(weight, rank, fmt, groupsize, refine_iters, act_rms,
+                                   refine_tol)
+    return _svdquant_split(weight, rank, fmt, groupsize, refine_iters, act_rms, refine_tol)
+
+
+def _layer_seed(seed: int | None, layer: str) -> int | None:
+    """A per-layer seed derived from the run's seed and the layer name.
+
+    Per layer rather than one seed for the whole run so that the result does not depend on
+    the order layers happen to be visited in, nor on how many refinement iterations the
+    previous layer took before its tolerance stopped it. Either would make a rebuild with a
+    different `--refine-tol` diverge everywhere instead of only where it should.
+
+    `zlib.crc32` rather than `hash()`: Python randomises string hashing per process, so
+    `hash()` here would be reproducible within a run and useless across runs -- the exact
+    failure this is meant to fix, hidden one level deeper.
+    """
+    if seed is None:
+        return None
+    return (seed + zlib.crc32(layer.encode("utf-8"))) % (2 ** 63)
+
+
+def _rng_devices(device: torch.device) -> list:
+    """Which generators `fork_rng` has to save and restore for work on `device`."""
+    return [device] if device.type == "cuda" else []
+
+
+def _svdquant_split(weight: torch.Tensor, rank: int, fmt: str, groupsize: int,
+                    refine_iters: int, act_rms, refine_tol: float):
     w = weight.float()
     d = _act_weighting(act_rms, w.shape[1], w.device)
     # With a weighting, both the SVD and the error metric work in the scaled space: minimising
@@ -521,7 +582,8 @@ def check_act_stats_coverage(stats: dict, keys, prefix: str, ranks: dict) -> Non
 def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", rank: int = 0,
             refine_iters: int = 100, variant: str = "unknown", progress_cb=None,
             rank_alloc: str = "uniform", act_stats: str | None = None,
-            weight_patch=None, refine_tol: float = REFINE_TOL):
+            weight_patch=None, refine_tol: float = REFINE_TOL,
+            seed: int | None = DEFAULT_SEED):
     """Quantize `src` into `dst`. Returns the summary line it printed.
 
     `rank` is a budget, `rank_alloc` decides how it is spread across the eight projection
@@ -592,7 +654,8 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                         # a None here cannot happen for a branched layer.
                         act = stats.get(layer[len(prefix):] if prefix else layer)
                         split = svdquant_split(w, leaf_rank, fmt, groupsize, refine_iters,
-                                               act_rms=act, refine_tol=refine_tol)
+                                               act_rms=act, refine_tol=refine_tol,
+                                               seed=_layer_seed(seed, layer))
                         if split is None:
                             print("  warning: {} is degenerate (zero or non-finite); "
                                   "quantizing it without a low-rank branch".format(layer),
@@ -683,6 +746,12 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
         # Two checkpoints with identical rank/refine settings are still different models if
         # one was activation-weighted, so this has to be recoverable from the file.
         "krea2_svdquant_act_stats": os.path.basename(act_stats) if act_stats else "",
+        # A build is reproducible only against the same seed AND the same device: the low-rank
+        # split draws a random probe matrix, and CPU and CUDA neither generate the same numbers
+        # from a seed nor reduce their GEMMs in the same order. Both go in the file so "why is
+        # my checkpoint not byte-identical to yours" is answerable from the file.
+        "krea2_svdquant_seed": "" if seed is None else str(seed),
+        "krea2_svdquant_device": str(device),
     }
     if progress_cb is not None:
         progress_cb(quantized, _EXPECTED_LAYERS, "writing {:.2f} GB ...".format(
@@ -802,6 +871,12 @@ def main():
                          "at runtime -- same rank, format, size and kernel")
     ap.add_argument("--out", default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                    help="seed for the randomized low-rank SVD, so a build is reproducible "
+                         "(default %(default)s). Reproducible on the same device only -- a "
+                         "CPU build and a CUDA build of the same checkpoint differ by ~1e-4 "
+                         "per weight whatever the seed. Pass -1 for the old unseeded "
+                         "behaviour, where even two runs on one GPU differ")
     args = ap.parse_args()
 
     if args.act_stats:
@@ -831,7 +906,8 @@ def main():
     try:
         convert(args.src, out, fmt, args.groupsize, args.device, rank, args.refine_iters,
                 variant=args.variant, rank_alloc=args.rank_alloc, act_stats=args.act_stats,
-                refine_tol=args.refine_tol)
+                refine_tol=args.refine_tol,
+                seed=None if args.seed < 0 else args.seed)
     except RuntimeError as exc:
         raise SystemExit(str(exc)) from None
 
