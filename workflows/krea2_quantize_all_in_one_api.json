@@ -1,0 +1,30 @@
+{
+  "1": {
+    "class_type": "Krea2SVDQuantEnvCheck",
+    "inputs": {},
+    "_meta": {
+      "title": "1. Env Check - verify CUDA kernel"
+    }
+  },
+  "2": {
+    "class_type": "Krea2SVDQuantQuantizeAllInOne",
+    "inputs": {
+      "source_dit": "turbo.safetensors",
+      "text_encoder": "qwen3vl_4b_bf16.safetensors",
+      "vae": "Krea2-HD-vae.safetensors",
+      "format": "svdq",
+      "te_format": "w4a4",
+      "rank": 64,
+      "refine_iters": 100,
+      "groupsize": 256,
+      "variant": "turbo",
+      "output_name": "",
+      "overwrite": false,
+      "act_stats": "krea2_act_stats_turbo.safetensors",
+      "seed": 0
+    },
+    "_meta": {
+      "title": "2. Quantize & Bake All-in-One Checkpoint"
+    }
+  }
+}

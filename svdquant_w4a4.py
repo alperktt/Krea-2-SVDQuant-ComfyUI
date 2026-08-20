@@ -33,6 +33,59 @@ from .svdquant_diag import BUF_L1, BUF_L2, _CATEGORY, branch_factors, log_dispat
 _L1 = "." + BUF_L1
 _L2 = "." + BUF_L2
 
+# How the two loaders answer `disable_dynamic=` when they build the patcher.
+VRAM_MANAGEMENT = ["auto", "classic"]
+
+# Both loaders offer the same choice, so the wording lives in one place. Long, because the
+# question it answers -- "why is this suddenly 30 s an iteration" -- is one nobody arrives
+# at the tooltip already understanding.
+VRAM_TOOLTIP = (
+    'Leave on "auto" unless something is wrong. "auto" lets ComfyUI manage this model the '
+    "way it manages any other, which on an ordinary launch means the dynamic-VRAM "
+    "streaming patcher -- that is what keeps iteration time flat once the model stops "
+    'fitting in VRAM. "classic" pins it to the older patcher, where a model that no longer '
+    "fits falls back to streaming weights per module per step and an iteration goes from "
+    "~1 s to 30-100 s. KREA2_DISABLE_DYNAMIC=1 forces classic for a whole server run."
+)
+
+
+def _disable_dynamic(mode: str = "auto") -> bool:
+    """Whether to pin this model to the classic `ModelPatcher`.
+
+    `auto` means "whatever ComfyUI would do for a stock UNETLoader", which since the
+    dynamic-VRAM work means the streaming `ModelPatcherDynamic` on any ordinary launch
+    (`main.py` swaps `CoreModelPatcher` for it unless --highvram/--novram/--gpu-only/--cpu
+    or --disable-dynamic-vram is set). This loader used to hardcode the pin, and that is
+    the whole reason an svdq checkpoint fell to per-module weight streaming past the point
+    where it stopped fitting -- 30-100 s an iteration -- while the same-size FP8/INT8/
+    noLowRank files, which go through the stock loader, did not.
+
+    Both conditions the pin was waiting on hold on current ComfyUI:
+
+    * the branch buffers survive the streaming patcher -- its `load()` walks
+      `named_buffers()`, moves every one to the load device and backs up the original, so
+      `svdq_l1`/`svdq_l2` end up resident and `add_low_rank`'s `cast_to` is a no-op;
+    * `module_size()` still counts them, because `_load_list` derives its per-module
+      budget from `model_management.module_size`, which sums `state_dict()` -- exactly
+      what `_publish_in_state_dict` exists to feed.
+
+    `classic` restores the old behaviour. It is kept because one thing here *is*
+    unmeasured: the streaming patcher moves those buffers with a plain `.to()` rather than
+    through its own allocator, so 1.6 GiB at rank 256 is real VRAM its `allocated_size`
+    bookkeeping does not see. If that turns out to matter on some card, the way back should
+    be a dropdown, not a downgrade.
+
+    The env var is the same escape hatch `KREA2_W4A4_OP=0` is, and for the same reason:
+    the choice is made once per load, so A/B-ing it means two server runs that differ by
+    exactly this.
+    """
+    if mode == "classic":
+        return True
+    if mode != "auto":
+        raise ValueError("vram_management must be one of {}, got {!r}".format(
+            VRAM_MANAGEMENT, mode))
+    return os.environ.get("KREA2_DISABLE_DYNAMIC") == "1"
+
 
 def has_branch(module: torch.nn.Module) -> bool:
     """True once this module carries a low-rank branch (i.e. it is a quantized linear)."""
@@ -61,9 +114,10 @@ def _publish_in_state_dict(module: torch.nn.Module) -> None:
     emits weight/scale/marker/bias and nothing else -- buffers never reach it. That
     matters because ``model_management.module_size()`` sums ``state_dict()``, and every
     per-module VRAM decision ComfyUI makes (the lowvram split in particular) is derived
-    from that number. Left alone, ~2.9 MB per layer and ~645 MB across the 224 blocks
-    would sit on the GPU while the budget believed it was free -- which is exactly how an
-    8 GB card OOMs on this checkpoint but not on the branch-free int8 one.
+    from that number. Left alone, 3.75-11 MiB per layer and 1.6 GiB across the 224 blocks
+    (measured off a rank-256 file; 0.4 GiB at rank 64) would sit on the GPU while the budget
+    believed it was free -- which is exactly how an 8 GB card OOMs on this checkpoint but
+    not on the branch-free int8 one.
 
     Emitting them under their own names also means a model saved out of ComfyUI carries
     the same ``<layer>.svdq_l1`` keys quantize_krea2.py writes, so it round-trips.
@@ -97,9 +151,9 @@ def attach_branch(module: torch.nn.Module, l1: torch.Tensor, l2: torch.Tensor,
     by `_publish_in_state_dict` -- on these modules persistence alone is not enough, see
     that function for why. Both steps are needed to get them counted by
     ``model_management.module_size()``, which is what every VRAM decision (full load, the
-    lowvram split, how much to free) is derived from. Uncounted, they are roughly 2.9 MB
-    per layer and 645 MB across the 224 blocks: the difference between fitting and OOMing
-    on an 8 GB card.
+    lowvram split, how much to free) is derived from. Uncounted, they are 3.75-11 MiB per
+    layer and 1.6 GiB across the 224 blocks at rank 256 (0.4 GiB at rank 64): the difference
+    between fitting and OOMing on an 8 GB card.
 
     `scale` is folded into l2 at attach time rather than applied to the output every step:
     l2 is [rank, in_features] while the output is [tokens, out_features], so this is about
@@ -339,39 +393,25 @@ def _install_custom_op(module: torch.nn.Module) -> bool:
     return True
 
 
-def load_svdquant_w4a4(path: str, model_options: dict | None = None,
-                       compile_safe: bool = True):
-    sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
-    # `comfy.sd.load_diffusion_model_state_dict` strips this prefix internally when it builds
-    # the module tree, but we walk that tree ourselves to attach branches, so we strip it too.
-    # `default=""` rather than raising: a loader must not blow up on a checkpoint with no
-    # blocks, and the "found no branches" error below says far more about what went wrong.
-    layer_prefix = detect_prefix(sd.keys(), default="")
+def _patcher_desc(patcher) -> str:
+    """Which patcher this model got, for the load summary.
 
-    branches: dict[str, dict[str, torch.Tensor]] = {}
-    for key in list(sd.keys()):
-        for suffix, slot in ((_L1, "l1"), (_L2, "l2")):
-            if key.endswith(suffix):
-                branches.setdefault(key[: -len(suffix)], {})[slot] = sd.pop(key)
-                break
-    if not branches:
-        raise ValueError(
-            "{} carries no svdq_l1/svdq_l2 tensors - it is a plain quantized checkpoint, "
-            "load it with UNETLoader instead".format(path)
-        )
+    Worth stating on every load rather than only when something goes wrong: "dynamic" and
+    "pinned" are the difference between a 1 s iteration and a 30 s one once the model stops
+    fitting, and the status output is the one place a user is told to look when generation
+    is slow. `is_dynamic` is wrapped because it is a newer ComfyUI API and a loader must not
+    fail to load a checkpoint over a status string.
+    """
+    try:
+        return "{} (dynamic vram: {})".format(
+            type(patcher).__name__, "on" if patcher.is_dynamic() else "off")
+    except Exception:
+        return type(patcher).__name__
 
-    # `disable_dynamic=True` pins this to the classic ModelPatcher. On current ComfyUI
-    # that is a no-op (`CoreModelPatcher is ModelPatcher`), but when upstream flips it to
-    # ModelPatcherDynamic the streaming patcher takes ownership of the weights via
-    # `load_model_weights(..., assign=patcher.is_dynamic())`, which we have not validated
-    # against the branch buffers. Keep it pinned until that path is tested; the
-    # diagnostics node reports which patcher is actually in use.
-    patcher = comfy.sd.load_diffusion_model_state_dict(
-        sd, model_options=model_options or {}, metadata=metadata, disable_dynamic=True
-    )
-    if patcher is None:
-        raise RuntimeError("could not detect a model in {}".format(path))
 
+def _attach_svdq_branches(patcher, branches: dict[str, dict[str, torch.Tensor]],
+                         layer_prefix: str, metadata: dict | None, path: str,
+                         compile_safe: bool = True) -> str:
     diffusion_model = patcher.model.diffusion_model
     model_dtype = patcher.model.get_dtype()
     attached = 0
@@ -453,9 +493,9 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
         compile_desc = "compile: all {} layers are graph breaks{}".format(
             attached, " ({})".format(_W4A4_OP_ERROR) if _W4A4_OP_ERROR else "")
     summary = ("w4a4 + low-rank: attached {} branches (rank {}, variant {}), "
-               "model_size {:.2f} GiB, {}".format(
+               "model_size {:.2f} GiB, {}, {}".format(
                    attached, rank_desc, variant, patcher.model_size() / 1024 ** 3,
-                   compile_desc))
+                   _patcher_desc(patcher), compile_desc))
     logging.info("[krea2-svdquant] %s", summary)
 
     dispatch = log_dispatch(diffusion_model)
@@ -465,7 +505,93 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
     # matters most for the dispatch warning: buried in the console, the people who most need
     # to read it are exactly the ones who never see it.
     patcher.krea2_load_summary = "\n".join(x for x in (summary, dispatch) if x)
+    return patcher.krea2_load_summary
+
+
+def load_svdquant_w4a4(path: str, model_options: dict | None = None,
+                       compile_safe: bool = True, vram_management: str = "auto"):
+    sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
+    # `comfy.sd.load_diffusion_model_state_dict` strips this prefix internally when it builds
+    # the module tree, but we walk that tree ourselves to attach branches, so we strip it too.
+    # `default=""` rather than raising: a loader must not blow up on a checkpoint with no
+    # blocks, and the "found no branches" error below says far more about what went wrong.
+    layer_prefix = detect_prefix(sd.keys(), default="")
+
+    branches: dict[str, dict[str, torch.Tensor]] = {}
+    for key in list(sd.keys()):
+        for suffix, slot in ((_L1, "l1"), (_L2, "l2")):
+            if key.endswith(suffix):
+                branches.setdefault(key[: -len(suffix)], {})[slot] = sd.pop(key)
+                break
+    if not branches:
+        raise ValueError(
+            "{} carries no svdq_l1/svdq_l2 tensors - it is a plain quantized checkpoint, "
+            "load it with UNETLoader instead".format(path)
+        )
+
+    # See `_disable_dynamic` for why this is no longer hardcoded to True. The diagnostics
+    # node and the load summary both report which patcher the model actually got.
+    patcher = comfy.sd.load_diffusion_model_state_dict(
+        sd, model_options=model_options or {}, metadata=metadata,
+        disable_dynamic=_disable_dynamic(vram_management)
+    )
+    if patcher is None:
+        raise RuntimeError("could not detect a model in {}".format(path))
+
+    _attach_svdq_branches(patcher, branches, layer_prefix, metadata, path, compile_safe)
     return patcher
+
+
+def load_svdquant_checkpoint(path: str, output_vae: bool = True, output_clip: bool = True,
+                            model_options: dict | None = None,
+                            te_model_options: dict | None = None,
+                            compile_safe: bool = True, vram_management: str = "auto"):
+    """Load an all-in-one Krea 2 checkpoint (diffusion model + text encoder + VAE).
+
+    If the checkpoint carries SVDQuant branches (model.diffusion_model.blocks.N.*.svdq_l1/l2),
+    they are extracted, the model is built via ComfyUI's load_state_dict_guess_config, and
+    the low-rank branches are attached. If the checkpoint is branchless (e.g. w4a4 or int8),
+    it is loaded cleanly without branches.
+    """
+    sd, metadata = comfy.utils.load_torch_file(path, return_metadata=True)
+
+    branches: dict[str, dict[str, torch.Tensor]] = {}
+    for key in list(sd.keys()):
+        for suffix, slot in ((_L1, "l1"), (_L2, "l2")):
+            if key.endswith(suffix):
+                branches.setdefault(key[: -len(suffix)], {})[slot] = sd.pop(key)
+                break
+
+    out = comfy.sd.load_state_dict_guess_config(
+        sd,
+        output_vae=output_vae,
+        output_clip=output_clip,
+        output_clipvision=False,
+        embedding_directory=folder_paths.get_folder_paths("embeddings"),
+        model_options=model_options or {},
+        te_model_options=te_model_options or {},
+        metadata=metadata,
+        disable_dynamic=_disable_dynamic(vram_management),
+    )
+    if out is None:
+        raise RuntimeError("could not detect a valid checkpoint in {}".format(path))
+
+    patcher, clip, vae, _ = out
+
+    if branches:
+        layer_prefix = detect_prefix(branches.keys(), default="")
+        _attach_svdq_branches(patcher, branches, layer_prefix, metadata, path, compile_safe)
+    else:
+        diffusion_model = patcher.model.diffusion_model
+        install_mask_guard(patcher)
+        dispatch = log_dispatch(diffusion_model)
+        summary = "all-in-one checkpoint (branchless): model_size {:.2f} GiB, {}".format(
+            patcher.model_size() / 1024 ** 3, _patcher_desc(patcher))
+        logging.info("[krea2-svdquant] %s", summary)
+        patcher.krea2_load_summary = "\n".join(x for x in (summary, dispatch) if x)
+
+    status = getattr(patcher, "krea2_load_summary", "")
+    return patcher, clip, vae, status
 
 
 class Krea2SVDQuantW4A4Loader:
@@ -479,7 +605,16 @@ class Krea2SVDQuantW4A4Loader:
                                "checkpoints have no branch and load with the stock UNETLoader "
                                "instead.",
                 }),
-            }
+            },
+            # Optional and appended last: ComfyUI matches `widgets_values` positionally, so
+            # inserting a widget anywhere else shifts every value in a workflow saved
+            # before this input existed.
+            "optional": {
+                "vram_management": (VRAM_MANAGEMENT, {
+                    "default": "auto",
+                    "tooltip": VRAM_TOOLTIP,
+                }),
+            },
         }
 
     RETURN_TYPES = ("MODEL", "STRING")
@@ -495,12 +630,59 @@ class Krea2SVDQuantW4A4Loader:
                    "no separate base model needed. The status output tells you whether the "
                    "fast int4 kernel is in play.")
 
-    def load(self, model_name):
+    def load(self, model_name, vram_management="auto"):
         path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
-        patcher = load_svdquant_w4a4(path)
+        patcher = load_svdquant_w4a4(path, vram_management=vram_management)
         status = getattr(patcher, "krea2_load_summary", "")
         return {"ui": {"text": [status]}, "result": (patcher, status)}
 
 
-NODE_CLASS_MAPPINGS = {"Krea2SVDQuantW4A4Loader": Krea2SVDQuantW4A4Loader}
-NODE_DISPLAY_NAME_MAPPINGS = {"Krea2SVDQuantW4A4Loader": "Krea2 SVDQuant W4A4 Loader"}
+class Krea2SVDQuantCheckpointLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "ckpt_name": (folder_paths.get_filename_list("checkpoints"), {
+                    "tooltip": "An all-in-one Krea2 checkpoint containing diffusion model, "
+                               "quantized text encoder, and VAE. If it carries SVDQuant "
+                               "branches (*.svdq_l1/*.svdq_l2), they will be attached automatically.",
+                }),
+            },
+            # See the sibling loader: appended last, for the same positional reason.
+            "optional": {
+                "vram_management": (VRAM_MANAGEMENT, {
+                    "default": "auto",
+                    "tooltip": VRAM_TOOLTIP,
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL", "CLIP", "VAE", "STRING")
+    RETURN_NAMES = ("model", "clip", "vae", "status")
+    OUTPUT_TOOLTIPS = ("Wire this to a KSampler.",
+                       "Wire this to CLIPTextEncode.",
+                       "Wire this to VAEDecode.",
+                       "Rank, variant, size and which kernel the quantized layers will "
+                       "actually dispatch to.")
+    OUTPUT_NODE = True
+    FUNCTION = "load"
+    CATEGORY = _CATEGORY
+    TITLE = "Krea2 SVDQuant Checkpoint Loader"
+    DESCRIPTION = ("Loads an all-in-one Krea2 checkpoint containing diffusion model, text encoder, "
+                   "and VAE in a single file. Attaches low-rank SVDQuant branches if present.")
+
+    def load(self, ckpt_name, vram_management="auto"):
+        path = folder_paths.get_full_path_or_raise("checkpoints", ckpt_name)
+        patcher, clip, vae, status = load_svdquant_checkpoint(
+            path, vram_management=vram_management)
+        return {"ui": {"text": [status]}, "result": (patcher, clip, vae, status)}
+
+
+NODE_CLASS_MAPPINGS = {
+    "Krea2SVDQuantW4A4Loader": Krea2SVDQuantW4A4Loader,
+    "Krea2SVDQuantCheckpointLoader": Krea2SVDQuantCheckpointLoader,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Krea2SVDQuantW4A4Loader": "Krea2 SVDQuant W4A4 Loader",
+    "Krea2SVDQuantCheckpointLoader": "Krea2 SVDQuant Checkpoint Loader",
+}

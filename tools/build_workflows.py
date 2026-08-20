@@ -208,6 +208,23 @@ TURBO_NOTE = """KREA 2 TURBO - SVDQuant W4A4
 5. LoRA: use the Krea2 SVDQuant LoRA Loader, not the stock one. The
    stock loader cannot patch a quantized weight and skips the blocks."""
 
+ALL_IN_ONE_TURBO_NOTE = """KREA 2 TURBO - ALL-IN-ONE CHECKPOINT
+
+1. Checkpoint goes in ComfyUI/models/checkpoints/.
+   This file is fully self-contained: it combines the diffusion model,
+   the 4-bit quantized text encoder (Qwen3-VL 4B), and the VAE into a
+   single safetensors file (~12 GB instead of 15.5 GB across 3 files).
+
+2. SVDQuant checkpoints (carrying low-rank factors) load with the
+   "Krea2 SVDQuant Checkpoint Loader" node. Branchless checkpoints
+   (--format w4a4 or int8) also load with stock CheckpointLoaderSimple.
+
+3. cfg MUST be 1.0. Krea 2 Turbo is cfg-distilled, so the negative
+   prompt is zeroed out (ConditioningZeroOut) rather than encoded.
+   8 steps with euler / simple scheduler is what the model was distilled for.
+
+4. 1024x1024 native resolution. Latent size MUST be multiples of 16."""
+
 BASE_NOTE = """KREA 2 BASE (non-turbo) - SVDQuant W4A4
 
 The loader node will be outlined in RED when you open this. That is
@@ -369,6 +386,66 @@ def build_turbo():
 
     groups = [
         g.group("Load", (500, 20, 420, 620)),
+        g.group("Prompt", (940, 20, 420, 620)),
+        g.group("Sample", (1360, 20, 420, 640), colour="#8a4"),
+    ]
+    return g.serialize(groups), g.serialize_api()
+
+
+def build_all_in_one_turbo():
+    g = Graph()
+    g.note(ALL_IN_ONE_TURBO_NOTE, 0, 0, size=(400, 620), title="READ ME FIRST")
+
+    loader = g.add("Krea2SVDQuantCheckpointLoader", 1, 0,
+                   outputs=[("MODEL", "MODEL"), ("CLIP", "CLIP"), ("VAE", "VAE"), ("STRING", "STRING")],
+                   widgets=[("ckpt_name", "Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank64-TEW4A4.safetensors")],
+                   title="Krea2 SVDQuant Checkpoint Loader", colour=TEAL, size=[400, 140])
+
+    pos = g.add("CLIPTextEncode", 2, 0, inputs=[("clip", "CLIP")],
+                outputs=[("CONDITIONING", "CONDITIONING")], widgets=[("text", PROMPT)],
+                title="Prompt", colour=GREEN, size=[400, 220])
+    neg = g.add("ConditioningZeroOut", 2, 1.4, inputs=[("conditioning", "CONDITIONING")],
+                outputs=[("CONDITIONING", "CONDITIONING")],
+                title="Negative (zeroed - required at cfg 1.0)", colour=GREEN,
+                size=[400, 60])
+    latent = g.add("EmptySD3LatentImage", 2, 2.2, outputs=[("LATENT", "LATENT")],
+                   widgets=[("width", 1024), ("height", 1024), ("batch_size", 1)],
+                   title="Latent 1024x1024", colour=GREEN,
+                   size=[400, 120])
+
+    sampler = g.add("KSampler", 3, 0,
+                    inputs=[("model", "MODEL"), ("positive", "CONDITIONING"),
+                            ("negative", "CONDITIONING"), ("latent_image", "LATENT")],
+                    outputs=[("LATENT", "LATENT")],
+                    widgets=[("seed", 987654321), (None, "randomize"), ("steps", 8), ("cfg", 1.0),
+                             ("sampler_name", "euler"), ("scheduler", "simple"),
+                             ("denoise", 1.0)],
+                    title="KSampler - 8 steps, cfg 1.0", colour=PURPLE, size=[400, 280])
+    decode = g.add("VAEDecode", 4, 0, inputs=[("samples", "LATENT"), ("vae", "VAE")],
+                   outputs=[("IMAGE", "IMAGE")], title="VAE Decode", colour=PURPLE,
+                   size=[300, 60])
+    save = g.add("SaveImage", 4, 0.7, inputs=[("images", "IMAGE")],
+                 widgets=[("filename_prefix", "krea2_turbo_aio_svdq")], title="Save", colour=PURPLE, size=[400, 300])
+
+    diag = g.add("Krea2SVDQuantDiagnostics", 3, 2.4, inputs=[("model", "MODEL")],
+                 outputs=[("MODEL", "MODEL"), ("STRING", "STRING")],
+                 widgets=[("mode", "dispatch"), ("tokens", 4096)],
+                 title="Diagnostics (optional - run if slow)", colour=YELLOW,
+                 size=[400, 130], api=False)
+
+    g.link(loader, "MODEL", sampler, "model")
+    g.link(loader, "CLIP", pos, "clip")
+    g.link(pos, "CONDITIONING", neg, "conditioning")
+    g.link(pos, "CONDITIONING", sampler, "positive")
+    g.link(neg, "CONDITIONING", sampler, "negative")
+    g.link(latent, "LATENT", sampler, "latent_image")
+    g.link(sampler, "LATENT", decode, "samples")
+    g.link(loader, "VAE", decode, "vae")
+    g.link(decode, "IMAGE", save, "images")
+    g.link(loader, "MODEL", diag, "model")
+
+    groups = [
+        g.group("Load All-in-One", (500, 20, 420, 280)),
         g.group("Prompt", (940, 20, 420, 620)),
         g.group("Sample", (1360, 20, 420, 640), colour="#8a4"),
     ]
@@ -718,6 +795,43 @@ def build_quantize():
     return g.serialize(groups), g.serialize_api()
 
 
+def build_quantize_all_in_one():
+    g = Graph()
+    note = """QUANTIZE ALL-IN-ONE - Bake DiT + Text Encoder + VAE
+
+This graph bakes three files into one unified checkpoint in models/checkpoints/:
+1. source_dit (in models/diffusion_models/): BF16 or already quantized.
+2. text_encoder (in models/text_encoders/): Qwen3-VL 4B BF16 (~8.88 GB -> ~3.2 GB W4A4).
+3. vae (in models/vae/): Krea2 VAE (~0.51 GB unquantized).
+
+Resulting file: ~12 GB in models/checkpoints/, loaded with Krea2 SVDQuant Checkpoint Loader."""
+    g.note(note, 0, 0, size=(460, 600), title="READ ME FIRST")
+
+    g.add("Krea2SVDQuantEnvCheck", 1, 0, outputs=[("report", "STRING")],
+          title="1. Env Check - verify CUDA kernel", colour=YELLOW,
+          size=[420, 120])
+    g.add("Krea2SVDQuantQuantizeAllInOne", 1, 0.9,
+          outputs=[("summary", "STRING")],
+          widgets=[("source_dit", "turbo.safetensors"),
+                   ("text_encoder", "qwen3vl_4b_bf16.safetensors"),
+                   ("vae", "Krea2-HD-vae.safetensors"),
+                   ("format", "svdq"),
+                   ("te_format", "w4a4"),
+                   ("rank", 64),
+                   ("refine_iters", 100),
+                   ("groupsize", 256),
+                   ("variant", "turbo"),
+                   ("output_name", ""),
+                   ("overwrite", False),
+                   ("act_stats", "krea2_act_stats_turbo.safetensors"),
+                   ("seed", 0)],
+          title="2. Quantize & Bake All-in-One Checkpoint", colour=TEAL,
+          size=[420, 520])
+
+    groups = [g.group("All-in-One Baker", (500, 20, 460, 700), colour="#8a4")]
+    return g.serialize(groups), g.serialize_api()
+
+
 def build_quantize_calibrated():
     g = Graph()
     g.note(CALIB_NOTE, 0, 0, size=(460, 1420), title="READ ME FIRST")
@@ -801,10 +915,12 @@ def main():
     _check_adapter_constant()
     os.makedirs(OUT_DIR, exist_ok=True)
     for name, build in (("krea2_turbo_svdquant_w4a4_t2i", build_turbo),
+                        ("krea2_turbo_all_in_one_t2i", build_all_in_one_turbo),
                         ("krea2_base_svdquant_w4a4_t2i", build_base),
                         ("krea2_turbo_svdquant_w4a4_lora", build_lora),
                         ("krea2_svdquant_diagnostics", build_diagnostics),
                         ("krea2_quantize", build_quantize),
+                        ("krea2_quantize_all_in_one", build_quantize_all_in_one),
                         ("krea2_quantize_calibrated", build_quantize_calibrated)):
         graph, api = build()
         ui_path = os.path.join(OUT_DIR, name + ".json")

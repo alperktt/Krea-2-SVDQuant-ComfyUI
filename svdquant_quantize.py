@@ -35,6 +35,13 @@ from .svdquant_diag import _CATEGORY
 # the ~8 GB output rather than exactly it.
 _MIN_FREE_BYTES = 12 * 1024 ** 3
 
+# All-in-one: the combined file is ~12 GB, and building one from a BF16 DiT writes an ~8 GB
+# intermediate first. Those two can land on different drives (the intermediate goes to
+# ComfyUI's temp directory), so they are checked separately rather than summed -- the old
+# single 15 GB check against the output drive was under the real peak either way.
+_MIN_FREE_ALLINONE = 15 * 1024 ** 3
+_MIN_FREE_INTERMEDIATE = 11 * 1024 ** 3
+
 
 def _free_bytes(path: str) -> int:
     return shutil.disk_usage(os.path.dirname(os.path.abspath(path))).free
@@ -267,5 +274,241 @@ class Krea2SVDQuantQuantize:
         return {"ui": {"text": [text]}, "result": (text,)}
 
 
-NODE_CLASS_MAPPINGS = {"Krea2SVDQuantQuantize": Krea2SVDQuantQuantize}
-NODE_DISPLAY_NAME_MAPPINGS = {"Krea2SVDQuantQuantize": "Krea2 SVDQuant Quantize"}
+class Krea2SVDQuantQuantizeAllInOne:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "source_dit": (folder_paths.get_filename_list("diffusion_models"), {
+                    "tooltip": "The Krea 2 DiT model: either a BF16 source (~24 GB, will be "
+                               "quantized first) or an already-quantized SVDQuant/W4A4/INT8 file.",
+                }),
+                "text_encoder": (folder_paths.get_filename_list("text_encoders"), {
+                    "tooltip": "The Qwen3-VL 4B BF16 text encoder safetensors (~8.88 GB). "
+                               "Its 252 linear projections will be quantized to te_format, "
+                               "reducing it to ~3.2 GB without losing the vision tower.",
+                }),
+                "vae": (folder_paths.get_filename_list("vae"), {
+                    "tooltip": "The Krea 2 VAE (~0.51 GB, kept unquantized).",
+                }),
+                "format": (["svdq", "w4a4", "int8", "fp8"], {
+                    "default": "svdq",
+                    "tooltip": "Diffusion model format. svdq: 4-bit weights and activations "
+                               "plus a low-rank bf16 correction branch.",
+                }),
+                "te_format": (["w4a4", "int8"], {
+                    "default": "w4a4",
+                    "tooltip": "Text encoder format: w4a4 (convrot_w4a4, ~3.2 GB) or int8 "
+                               "(int8_tensorwise, ~5.2 GB).",
+                }),
+                "rank": ("INT", {
+                    "default": 64, "min": 8, "max": 1024, "step": 8,
+                    "tooltip": "svdq only: size of the low-rank branch on the diffusion model.",
+                }),
+                "refine_iters": ("INT", {
+                    "default": 100, "min": 0, "max": 200,
+                    "tooltip": "svdq only (if source_dit is BF16). Refines the branch against "
+                               "quantization error. Ignored if source_dit is already quantized.",
+                }),
+                "groupsize": ("INT", {
+                    "default": 256, "min": 32, "max": 1024, "step": 32,
+                    "tooltip": "convrot rotation group size.",
+                }),
+                "variant": (["turbo", "base", "unknown"], {
+                    "default": "turbo",
+                    "tooltip": "Which Krea 2 release this is.",
+                }),
+                "output_name": ("STRING", {
+                    "default": "",
+                    "tooltip": "Filename in models/checkpoints/. Leave empty to derive automatically.",
+                }),
+                "overwrite": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Allow overwriting existing output checkpoint.",
+                }),
+            },
+            "optional": {
+                "act_stats": ("STRING", {
+                    "default": "",
+                    "tooltip": "svdq only (if source_dit is BF16): activation statistics file.",
+                }),
+                "seed": ("INT", {
+                    "default": 0, "min": -1, "max": 0xFFFFFFFF,
+                    "tooltip": "Random seed for reproducible SVD.",
+                }),
+            },
+        }
+
+    @staticmethod
+    def _out_path(output_name, variant, format, rank, te_format) -> str:
+        """Where this run will write. Shared, so validation checks the path `run` will use."""
+        ckpt_dir = folder_paths.get_folder_paths("checkpoints")[0]
+        if output_name.strip():
+            name = output_name.strip()
+            if not name.endswith(".safetensors"):
+                name += ".safetensors"
+            return os.path.join(ckpt_dir, name)
+        stem = "Krea2-{}".format(variant.capitalize()) if variant != "unknown" else "Krea2"
+        tag = "SVDQuant-W4A4-rank{}".format(rank) if rank else format.upper()
+        return os.path.join(ckpt_dir, "{}-AllInOne-{}-TE{}.safetensors".format(
+            stem, tag, te_format.upper()))
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, source_dit, text_encoder, vae, output_name, overwrite,
+                        variant, format, te_format, rank):
+        """Same pre-flight as the sibling node, for the same reason.
+
+        This one writes ~12 GB and, from a BF16 source, spends ten minutes quantizing a DiT
+        before it reaches the combiner -- so "that file already exists" has to arrive at
+        Queue time rather than after the expensive part.
+        """
+        for folder, name in (("diffusion_models", source_dit),
+                             ("text_encoders", text_encoder), ("vae", vae)):
+            try:
+                folder_paths.get_full_path_or_raise(folder, name)
+            except Exception as exc:
+                return str(exc)
+        try:
+            _, rank = resolve_format(format, rank, rank_was_set=False)
+        except Exception as exc:
+            return str(exc)
+
+        dst = cls._out_path(output_name, variant, format, rank, te_format)
+        if os.path.exists(dst) and not overwrite:
+            return ("{} already exists. Enable 'overwrite', or set a different output_name."
+                    .format(dst))
+        free = _free_bytes(dst)
+        if free < _MIN_FREE_ALLINONE:
+            return ("only {:.1f} GB free on the drive holding {}; the combined checkpoint "
+                    "needs roughly {:.0f} GB.".format(free / 1024 ** 3, os.path.dirname(dst),
+                                                      _MIN_FREE_ALLINONE / 1024 ** 3))
+        return True
+
+    @classmethod
+    def IS_CHANGED(cls, *args, **kwargs):
+        # ~12 GB written as a side effect. Same reasoning as the sibling node: a cached
+        # summary claims a file exists that the user may since have deleted.
+        return float("nan")
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("summary",)
+    OUTPUT_TOOLTIPS = ("Size, tensor counts and loader instructions for the baked checkpoint.",)
+    OUTPUT_NODE = True
+    FUNCTION = "run"
+    CATEGORY = _CATEGORY
+    TITLE = "Krea2 SVDQuant Quantize All-in-One"
+    DESCRIPTION = ("Bakes DiT, 4-bit quantized Qwen3-VL 4B text encoder, and VAE into a single "
+                   "combined checkpoint in ComfyUI/models/checkpoints/ (~12 GB instead of 15.5 GB "
+                   "across three files).")
+
+    def run(self, source_dit, text_encoder, vae, format, te_format, rank, refine_iters,
+            groupsize, variant, output_name, overwrite, act_stats="", seed=0):
+        from safetensors import safe_open
+        # `.build_all_in_one`, not `.tools.build_all_in_one`: `.comfyignore` keeps `tools/`
+        # out of the published package, so the old import raised ImportError for every
+        # Registry/Manager install and worked only for a git clone.
+        from .build_all_in_one import build_all_in_one_checkpoint
+
+        dit_src = folder_paths.get_full_path_or_raise("diffusion_models", source_dit)
+        te_src = folder_paths.get_full_path_or_raise("text_encoders", text_encoder)
+        vae_src = folder_paths.get_full_path_or_raise("vae", vae)
+
+        fmt, rank = resolve_format(format, rank, rank_was_set=False)
+
+        os.makedirs(folder_paths.get_folder_paths("checkpoints")[0], exist_ok=True)
+        dst = self._out_path(output_name, variant, format, rank, te_format)
+
+        if os.path.exists(dst) and not overwrite:
+            raise RuntimeError(
+                "{} already exists. Enable 'overwrite', or set a different output_name."
+                .format(dst))
+
+        free = _free_bytes(dst)
+        if free < _MIN_FREE_ALLINONE:
+            raise RuntimeError(
+                "only {:.1f} GB free on the drive holding {}; baking all-in-one needs "
+                "roughly {:.0f} GB headroom.".format(
+                    free / 1024 ** 3, dst, _MIN_FREE_ALLINONE / 1024 ** 3))
+
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+
+        # Check if DiT is already quantized or needs quantization
+        with safe_open(dit_src, framework="pt", device="cpu") as handle:
+            keys = list(handle.keys())
+        already_quantized = any(k.endswith(".comfy_quant") for k in keys)
+        temp_dit = None
+
+        if not already_quantized:
+            stats_path = act_stats.strip() or None
+            if stats_path is not None and not os.path.isabs(stats_path):
+                stats_path = os.path.join(folder_paths.get_output_directory(), stats_path)
+            # ComfyUI's temp directory rather than models/checkpoints/: a run killed
+            # mid-quantize leaves this ~8 GB file behind -- the `finally` below only covers
+            # a clean unwind -- and beside the real checkpoints it shows up in every loader
+            # dropdown as something that looks loadable and is not.
+            temp_dir = folder_paths.get_temp_directory()
+            os.makedirs(temp_dir, exist_ok=True)
+            temp_dit = os.path.join(temp_dir,
+                                    os.path.basename(dst) + ".tmp_dit.safetensors")
+            temp_free = _free_bytes(temp_dit)
+            if temp_free < _MIN_FREE_INTERMEDIATE:
+                raise RuntimeError(
+                    "only {:.1f} GB free on the drive holding {}; quantizing the DiT first "
+                    "writes an intermediate of roughly {:.0f} GB there.".format(
+                        temp_free / 1024 ** 3, temp_dir,
+                        _MIN_FREE_INTERMEDIATE / 1024 ** 3))
+            logging.info("[krea2-svdquant] quantizing DiT first: %s -> %s", dit_src, temp_dit)
+            convert(dit_src, temp_dit, fmt, groupsize, "cuda", rank, refine_iters,
+                    variant=variant, rank_alloc="uniform", act_stats=stats_path,
+                    seed=None if seed < 0 else int(seed))
+            active_dit = temp_dit
+        else:
+            active_dit = dit_src
+
+        pbar = comfy.utils.ProgressBar(1)
+        state = {"total": 0}
+
+        def progress(done, total, message):
+            if total != state["total"]:
+                state["total"] = total
+                pbar.total = total
+            pbar.update_absolute(done, total)
+
+        try:
+            summary = build_all_in_one_checkpoint(
+                dit_path=active_dit,
+                text_encoder_path=te_src,
+                vae_path=vae_src,
+                out_path=dst,
+                fmt_name=format,
+                te_format=te_format,
+                rank=rank,
+                variant=variant,
+                groupsize=groupsize,
+                device="cuda",
+                progress_cb=progress,
+            )
+        finally:
+            if temp_dit and os.path.exists(temp_dit):
+                try:
+                    os.remove(temp_dit)
+                except Exception:
+                    pass
+
+        hint = SAMPLER_HINTS.get(variant)
+        loader = ("Krea2 SVDQuant Checkpoint Loader" if rank else "CheckpointLoaderSimple")
+        text = "\n".join(x for x in (
+            summary, "Load it with {}.".format(loader), hint) if x)
+        logging.info("[krea2-svdquant] %s", text)
+        return {"ui": {"text": [text]}, "result": (text,)}
+
+
+NODE_CLASS_MAPPINGS = {
+    "Krea2SVDQuantQuantize": Krea2SVDQuantQuantize,
+    "Krea2SVDQuantQuantizeAllInOne": Krea2SVDQuantQuantizeAllInOne,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "Krea2SVDQuantQuantize": "Krea2 SVDQuant Quantize",
+    "Krea2SVDQuantQuantizeAllInOne": "Krea2 SVDQuant Quantize All-in-One",
+}
