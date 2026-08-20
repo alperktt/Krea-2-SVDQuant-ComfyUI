@@ -15,15 +15,27 @@ down gets run twice.
 ComfyUI would do for any other model, which on an ordinary launch is `ModelPatcherDynamic`.
 The `vram_management` input (and `KREA2_DISABLE_DYNAMIC=1`) restores the pin.
 
-The pin was waiting on two conditions. Both hold on current ComfyUI, checked against the
-source rather than assumed:
+The pin was waiting on two conditions. Both hold on current ComfyUI, and both were
+measured, not argued from the source:
 
 1. **The branch buffers survive the streaming patcher.** `ModelPatcherDynamic.load()` ends
    by walking `self.model.named_buffers(recurse=True)`, moving every buffer to the load
-   device with `set_attr_buffer` and stashing the original in `self.backup_buffers`. So
-   `svdq_l1`/`svdq_l2` end up resident on the GPU and `add_low_rank`'s `cast_to` is a no-op
-   — the opposite of the feared per-step multi-MB staging copy. Unload is symmetric:
-   `partially_unload()` falls through to `restore_loaded_backups()`, which puts them back.
+   device with `set_attr_buffer` and stashing the original in `self.backup_buffers`. Unload
+   is symmetric: `partially_unload()` falls through to `restore_loaded_backups()`.
+
+   Measured on a 3090 with `--reserve-vram 15` (~7 GB usable against an 8.51 GiB model),
+   read from the diagnostics node *after* a render — which is the only time it means
+   anything, since both arms show `cpu` at load time:
+
+   | `vram_management` | factor devices | weight devices | lowvram |
+   |---|---|---|---|
+   | `auto` | **448 × `cuda:0`** | 224 × `cpu` | False |
+   | `classic` | 368 × `cpu`, 80 × `cuda:0` | 184 × `cpu`, 40 × `cuda:0` | True |
+
+   So `add_low_rank`'s `cast_to` really is a no-op under `auto` — the opposite of the
+   feared per-step multi-MB staging copy — and the division of labour is the one you would
+   pick by hand: the small branch every step needs stays resident, the 4-bit weights
+   stream.
 2. **`module_size()` still counts them.** `_load_list()` derives its per-module budget from
    `comfy.model_management.module_size`, which sums `state_dict()` — exactly what
    `_publish_in_state_dict` exists to feed. The 1.6 GiB at rank 256 is visible to the
@@ -42,6 +54,31 @@ Two things that also had to be true and are:
 **What is still open:** the buffers are moved with a plain device copy, outside the dynamic
 allocator's `allocated_size` accounting. Real VRAM, invisible bookkeeping. That is why the
 escape hatch shipped with the fix rather than the fix shipping alone.
+
+## 1b. Decide which patcher renders a LoRA *correctly*
+
+**Status: open, and the only loose end left by the unpin.** Without a LoRA the two patchers
+are bit-identical. With one they are not, and `classic` is additionally not reproducible --
+its output moves with how much of the model was offloaded:
+
+| pair | PSNR | SSIM |
+|---|---|---|
+| `auto` vs `auto`, three runs across two VRAM budgets | ∞ | 1.000000 |
+| `classic` full-load vs `classic` under `--reserve-vram 15` | 17.86 dB | 0.712 |
+| `classic` vs `auto` | 15.4-15.9 dB | 0.61-0.65 |
+
+The branch bookkeeping is identical in both arms -- 224 quantized layers branched, 32
+patched normally, logged the same either way -- so this is not the node failing to attach
+something. The suspects are the 32 non-quantized layers, which go through ComfyUI's own
+`add_patches`, and the fact that the classic path has two ways of applying a patch (in place
+when resident, `LowVramPatch` at cast time when not) while the dynamic path has one.
+
+`auto` being invariant is a good sign and not a proof. **Nothing here establishes which
+image is the faithful one.** What would: apply the same LoRA to a BF16 Krea 2 and compare
+both arms against it with `tools/fidelity_bench.py` -- the harness already does paired
+LPIPS against a BF16 reference, so this is a run, not new machinery. Until that happens the
+honest statement is the one in TROUBLESHOOTING.md: the default changed, the output changed,
+and the new one is at least reproducible.
 
 ## 2. Act-aware at ranks other than 256
 

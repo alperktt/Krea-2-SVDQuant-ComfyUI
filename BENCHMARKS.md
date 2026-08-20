@@ -4,6 +4,15 @@ Two independent tests on **Krea 2 Turbo**, all checkpoints produced by `quantize
 in this repo. Same seed across every checkpoint in a given test so images are directly
 comparable. RTX 3090, cu130 torch build.
 
+> **Which patcher these were measured on.** Every speed number here was taken while the
+> svdq loader still pinned the model to the classic `ModelPatcher` (`disable_dynamic=True`).
+> That pin is gone; the default is now ComfyUI's dynamic-VRAM patcher. On a card where the
+> model fits, the patcher is not on the hot path and the numbers should be unaffected — a
+> spot check at rank 256, 1024², under the dynamic patcher measured 0.794 s/step, which sits
+> in the same range as the table below. But that is one point, not a re-run: **these tables
+> have not been regenerated since the change.** `tools/speed_bench.py` produces them if you
+> want them re-measured.
+
 > **The quality scores in Tests 1 and 2 have been withdrawn (2026-07-27).** They came from
 > an LLM judge (Gemini 3.5 Flash Lite) that turned out to be saturated: 9 of the 12 rows in
 > the LoRA table scored a flat 10.00/10, and the whole t2i table spanned 0.46 points. An

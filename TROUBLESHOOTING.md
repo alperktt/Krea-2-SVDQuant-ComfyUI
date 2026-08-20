@@ -170,6 +170,35 @@ argument, just no longer as a workaround for a 30x slowdown:
    256 and statistically identical to it *as long as you never load a LoRA*.
 3. Watch the loader's `model_size` line — it reports the real number, branch included.
 
+## My LoRA renders changed after updating (and the image moves when VRAM gets tight)
+
+Measured, real, and only half explained. Read this before concluding a LoRA is broken.
+
+With **no LoRA loaded**, the two patchers are bit-identical — same seed, same graph, same
+pixels, verified at three different VRAM budgets. With a **LoRA loaded** they are not:
+
+| pair | PSNR | SSIM |
+|---|---|---|
+| `auto` vs `auto`, different VRAM budgets, three runs | ∞ | 1.000000 |
+| `classic` full-load vs `classic` under pressure | 17.86 dB | 0.712 |
+| `classic` vs `auto` | 15.4-15.9 dB | 0.61-0.65 |
+
+So the instability is on the `classic` side: it renders a LoRA differently depending on how
+much of the model got offloaded, because ComfyUI's classic path applies patches through
+`LowVramPatch` at cast time when a layer is not resident and in place when it is. The
+dynamic patcher has one path and uses it always, which is why all three `auto` runs agree
+to the bit.
+
+Until this release the loader pinned to `classic`, so **your previous LoRA output was the
+classic one** — and, if you were near your VRAM limit, not necessarily reproducible either.
+Now the default is `auto` and the result is stable. It is also a different image.
+
+**What has not been established: which one is numerically right.** Determinism is not
+correctness. Settling it needs the same LoRA applied to a reference the quantized path can
+be compared against, and that reference does not exist here yet — see
+[ROADMAP.md](ROADMAP.md). If you preferred the old look, `vram_management=classic` on the
+loader node reproduces it, with the pressure-dependence that comes with it.
+
 ## Out of memory on a small card (and int8 works fine)
 
 Fixed. The low-rank factors were attached as non-persistent buffers, which ComfyUI's
@@ -182,8 +211,20 @@ checkpoints carry no branch, so they were never affected.
 
 They are now published into `state_dict()` under their own `svdq_l1` / `svdq_l2` keys and
 staged per call via `comfy.model_management.cast_to`, so they are budgeted and offloaded
-like any other weight. `mode=env` on the diagnostics node reports the factor devices — under
-lowvram they should sit on `cpu` between steps, not `cuda`.
+like any other weight.
+
+`mode=env` on the diagnostics node reports the factor devices, and **what you should see
+depends on which patcher you are on** — read it after a render, not before, because at load
+time both arms say `cpu`:
+
+| `vram_management` | healthy `factor devices` |
+|---|---|
+| `auto` (dynamic, the default) | all on `cuda:0` — 448 of them at rank 256 |
+| `classic` | mostly `cpu`, staged per call |
+
+`cuda` under `auto` is not the old bug coming back; it is the streaming patcher keeping the
+small always-needed branch resident and streaming the 4-bit weights instead, which is what
+makes it fast. Measured both ways on a 3090 under `--reserve-vram 15`.
 
 One gap remains and it is upstream, not here: `QuantizedTensor.nbytes` reports only the
 packed weight, so the W4A4 `weight_scale` (~3 MB/layer) is still invisible to ComfyUI's

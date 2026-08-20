@@ -60,11 +60,16 @@ def _disable_dynamic(mode: str = "auto") -> bool:
     where it stopped fitting -- 30-100 s an iteration -- while the same-size FP8/INT8/
     noLowRank files, which go through the stock loader, did not.
 
-    Both conditions the pin was waiting on hold on current ComfyUI:
+    Both conditions the pin was waiting on hold on current ComfyUI, and both were
+    measured rather than argued from the source:
 
-    * the branch buffers survive the streaming patcher -- its `load()` walks
-      `named_buffers()`, moves every one to the load device and backs up the original, so
-      `svdq_l1`/`svdq_l2` end up resident and `add_low_rank`'s `cast_to` is a no-op;
+    * the branch buffers survive the streaming patcher. Its `load()` walks
+      `named_buffers()`, moves every one to the load device and backs up the original.
+      Read off the diagnostics node after a render, under enough pressure to force
+      offloading: all 448 factors on `cuda:0` while all 224 quantized weights sit on `cpu`
+      and stream. So `add_low_rank`'s `cast_to` is a no-op, and the split is the one you
+      would choose -- the small branch every step needs stays resident, the big weights do
+      not. The same reading under `classic` is 368 factors on `cpu`, i.e. staged per call.
     * `module_size()` still counts them, because `_load_list` derives its per-module
       budget from `model_management.module_size`, which sums `state_dict()` -- exactly
       what `_publish_in_state_dict` exists to feed.

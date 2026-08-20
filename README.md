@@ -477,8 +477,9 @@ coverage.
 **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)** covers the things that actually go wrong:
 generation slower than FP8 (nearly always a pre-cu130 torch build), no speedup at all on
 RTX 20-series, `Pin error.` in the console, iteration time jumping to 30-100 s past ~12 GB
-(fixed — update if you see it), out-of-memory on a small card, LoRAs that match no layer,
-sage-attention artifacts, and "left over keys in diffusion model" after re-saving.
+(fixed — update if you see it), **LoRA renders changing after this release** (measured, and
+the old behaviour was the unstable one), out-of-memory on a small card, LoRAs that match no
+layer, sage-attention artifacts, and "left over keys in diffusion model" after re-saving.
 
 Start with the **Krea2 SVDQuant Diagnostics** node between the loader and the KSampler, or:
 
