@@ -166,9 +166,24 @@ rank is spent*. The quantity that moved is not the one that was being measured. 
 conclusions in this entry have now been reversed by measuring a better-chosen quantity; the
 lesson is the same both times.
 
-Two things this does not yet separate: rank 64 → 256 and act-aware off → on were changed
-together, so the attribution is unknown, and it matters practically (rank 64 is 0.56 GB of
-branch against 2.22 GB). And it is still one prompt, one seed pair, five frames.
+Separating the two, at fixed rank and fixed everything else:
+
+| arm | LPIPS ↓ | PSNR | SSIM | size |
+|---|---|---|---|---|
+| rank 64, no act-aware | 0.5645 | 13.57 dB | 0.4573 | 11.11 GB |
+| rank 64, **act-aware** | 0.4213 | 15.16 dB | 0.5677 | 11.11 GB |
+| rank 128, act-aware | 0.5169 | 14.91 dB | 0.5480 | 11.67 GB |
+| rank 256, act-aware | **0.3071** | **17.03 dB** | **0.6504** | 12.78 GB |
+
+Act-aware at fixed rank 64 is worth 0.143 of the 0.257 total; rank 64 → 256 on top of it is
+worth the other 0.114. **Neither alone is enough** — plain rank was already measured as
+nearly dead, and act-aware at rank 64 still sits well short of rank 256.
+
+Rank 128 scoring *worse* than rank 64 is the useful part of the table: it breaks the
+ordering the other three rows imply, which is what a single cell looks like when the
+sampling trajectory is chaotic. Treat individual ~0.1 LPIPS gaps here as unresolved. What
+survives the noise is the size of the act-aware effect and rank 256 being clear of
+everything else.
 
 ### Dead ends, measured
 
