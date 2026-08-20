@@ -398,7 +398,7 @@ def build_all_in_one_turbo():
 
     loader = g.add("Krea2SVDQuantCheckpointLoader", 1, 0,
                    outputs=[("MODEL", "MODEL"), ("CLIP", "CLIP"), ("VAE", "VAE"), ("STRING", "STRING")],
-                   widgets=[("ckpt_name", "Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank64-TEW4A4.safetensors")],
+                   widgets=[("ckpt_name", "Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank256-actaware-TEW4A4.safetensors")],
                    title="Krea2 SVDQuant Checkpoint Loader", colour=TEAL, size=[400, 140])
 
     pos = g.add("CLIPTextEncode", 2, 0, inputs=[("clip", "CLIP")],

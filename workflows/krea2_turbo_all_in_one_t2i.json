@@ -82,7 +82,7 @@
         "Node name for S&R": "Krea2SVDQuantCheckpointLoader"
       },
       "widgets_values": [
-        "Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank64-TEW4A4.safetensors"
+        "Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank256-actaware-TEW4A4.safetensors"
       ],
       "title": "Krea2 SVDQuant Checkpoint Loader",
       "color": "#233",

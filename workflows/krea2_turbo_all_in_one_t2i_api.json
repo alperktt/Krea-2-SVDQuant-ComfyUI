@@ -2,7 +2,7 @@
   "1": {
     "class_type": "Krea2SVDQuantCheckpointLoader",
     "inputs": {
-      "ckpt_name": "Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank64-TEW4A4.safetensors"
+      "ckpt_name": "Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank256-actaware-TEW4A4.safetensors"
     },
     "_meta": {
       "title": "Krea2 SVDQuant Checkpoint Loader"

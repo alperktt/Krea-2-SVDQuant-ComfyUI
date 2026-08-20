@@ -23,14 +23,14 @@ own quantization backend and is 100% reproducible.
 ## 🚀 Quick Start (Choose Your Setup)
 
 ### Option 1: 🌟 1-Click All-in-One Checkpoint (Recommended)
-> **Zero extra downloads!** DiT model, 4-bit Qwen3-VL 4B text encoder, and VAE are combined into **a single ~12 GB file**.
+> **Zero extra downloads!** DiT model, 4-bit Qwen3-VL 4B text encoder, and VAE are combined into **a single 12.77 GB file**.
 
 1. **Install custom nodes:**
    ```bash
-   git clone https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI custom_nodes/krea2-svdquant
+   git clone https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI custom_nodes/krea-2-svdquant
    ```
 2. **Download the unified checkpoint:**
-   - Download `Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank64-TEW4A4.safetensors` (~12 GB) from [Hugging Face](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI).
+   - Download `Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank256-actaware-TEW4A4.safetensors` (12.77 GB) from [Hugging Face](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI).
    - Place it in: `ComfyUI/models/checkpoints/`
 3. **Run in ComfyUI:**
    - Drag [`workflows/krea2_turbo_all_in_one_t2i.json`](workflows/krea2_turbo_all_in_one_t2i.json) into your ComfyUI canvas.
@@ -43,7 +43,7 @@ own quantization backend and is 100% reproducible.
 
 1. **Install custom nodes:**
    ```bash
-   git clone https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI custom_nodes/krea2-svdquant
+   git clone https://github.com/alperktt/Krea-2-SVDQuant-ComfyUI custom_nodes/krea-2-svdquant
    ```
 2. **Download the 3 files:**
    - **DiT Checkpoint** → `ComfyUI/models/diffusion_models/` (from [Hugging Face](https://huggingface.co/AlperKTS/Krea-2-SVDQuant-ComfyUI))
@@ -58,7 +58,7 @@ own quantization backend and is 100% reproducible.
 
 | Checkpoint File | Format & Type | Size | Destination Folder | Loader Node | Recommended For |
 |---|---|---|---|---|---|
-| **`Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank64-TEW4A4.safetensors`** | **All-in-One** (DiT + 4-bit TE + VAE) | **~12.0 GB** | `models/checkpoints/` | **Krea2 SVDQuant Checkpoint Loader** | **Best for 1-click generation. Easiest setup.** |
+| **`Krea2-Turbo-AllInOne-SVDQuant-W4A4-rank256-actaware-TEW4A4.safetensors`** | **All-in-One** (DiT + 4-bit TE + VAE, rank 256 act-aware) | **12.77 GB** | `models/checkpoints/` | **Krea2 SVDQuant Checkpoint Loader** | **Best for 1-click generation. Easiest setup, and the rank that holds up under a LoRA.** |
 | **`Krea2-Turbo-SVDQuant-W4A4-rank256-actaware.safetensors`** | Standalone DiT (svdq r256 actaware) | 9.10 GB | `models/diffusion_models/` | **Krea2 SVDQuant W4A4 Loader** | Best standalone DiT with LoRA support |
 | **`Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors`** | Standalone DiT (svdq r64) | 7.90 GB | `models/diffusion_models/` | **Krea2 SVDQuant W4A4 Loader** | Smaller footprint without LoRA |
 | **`Krea2-Turbo-W4A4-noLowRank.safetensors`** | Standalone DiT (branchless w4a4) | 7.50 GB | `models/diffusion_models/` | Stock **UNETLoader** | Fastest (~9% faster per step) |
@@ -76,7 +76,7 @@ Eight ready-to-use workflows in [`workflows/`](workflows/):
 
 | Workflow File | Purpose | Setup Type |
 |---|---|---|
-| [`krea2_turbo_all_in_one_t2i.json`](workflows/krea2_turbo_all_in_one_t2i.json) | **1-Click Generation** (Single ~12 GB file) | All-in-One |
+| [`krea2_turbo_all_in_one_t2i.json`](workflows/krea2_turbo_all_in_one_t2i.json) | **1-Click Generation** (single 12.77 GB file) | All-in-One |
 | [`krea2_turbo_svdquant_w4a4_t2i.json`](workflows/krea2_turbo_svdquant_w4a4_t2i.json) | Standard Turbo text-to-image (8 steps, `cfg 1.0`) | 3-File Modular |
 | [`krea2_turbo_svdquant_w4a4_lora.json`](workflows/krea2_turbo_svdquant_w4a4_lora.json) | Turbo with LoRA/LoKr support (`bypass`, `svd delta`, `bake`) | 3-File Modular |
 | [`krea2_base_svdquant_w4a4_t2i.json`](workflows/krea2_base_svdquant_w4a4_t2i.json) | Base non-turbo model (50 steps, `cfg 3.5`) | 3-File Modular |
@@ -235,7 +235,7 @@ whole run (54 s to ~6 min), it unloads any resident model to take the GPU, and i
 From a terminal:
 
 ```bash
-cd ComfyUI/custom_nodes/krea2-svdquant
+cd ComfyUI/custom_nodes/krea-2-svdquant
 python quantize_krea2.py /path/to/krea2_bf16.safetensors --format svdq --rank 256 \
   --act-stats krea2_act_stats_turbo.safetensors
 ```
