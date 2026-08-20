@@ -118,20 +118,26 @@ rank 64, that did not reproduce.
 Against the 40 GB bf16 source, 4-step turbo LoRA, 640×352, 5 frames, one prompt, one seed,
 mean over frames:
 
-| | PSNR | SSIM | size |
-|---|---|---|---|
-| **noise floor** — two bf16 runs, different seeds | 12.27 dB | 0.3669 | — |
-| svdq rank 64 (branch) | 13.57 dB | 0.4573 | 11.11 GB |
-| w4a4 noLowRank (no branch) | 13.57 dB | 0.4729 | 10.56 GB |
+| | LPIPS ↓ | PSNR | SSIM | size |
+|---|---|---|---|---|
+| **noise floor** — two bf16 runs, different seeds | 0.5844 | 12.27 dB | 0.3669 | — |
+| svdq rank 64 (branch) | **0.5645** | 13.57 dB | 0.4573 | 11.11 GB |
+| w4a4 noLowRank (no branch) | 0.5963 | 13.57 dB | 0.4729 | 10.56 GB |
 
-**The branch buys 0.00 dB and costs 0.55 GB.** Both quantized arms sit 1.30 dB above the
-floor, i.e. equally close to bf16, and the branchless one is marginally ahead on SSIM.
+**On LPIPS the branch is worth 0.032**, and it is the difference between landing just inside
+the noise floor and just outside it. PSNR and SSIM cannot see this at all — they score the
+two arms identically to two decimal places, and SSIM ranks the branchless one *ahead*.
 
-Read it with the cautions this repo already applies to its own numbers. The whole
-measurable range here is ~1.3 dB wide, both arms are at the top of it, and this is a single
-cell — one prompt, one seed pair — which is the methodology `tools/fidelity_bench.py` exists
-to avoid. It is enough to say the branch is not obviously earning its bytes on H3 stills;
-it is not enough to say it never will.
+That disagreement is the finding, and it is a correction: an earlier revision of this entry
+read "the branch buys 0.00 dB and costs 0.55 GB", concluded from PSNR/SSIM alone. This repo
+already argues against exactly that mistake -- `fidelity_bench.py` scores on LPIPS for a
+reason -- and the claim was made anyway. It is withdrawn.
+
+What survives is smaller and less comfortable. All three arms sit around LPIPS 0.58 against
+the reference, so **4-bit H3 is a long way from bf16 whatever the branch does**; 0.032 is a
+small margin next to a 0.58 floor. The branch helps and does not rescue. And this is still
+one cell -- one prompt, one seed pair, five frames -- which is the methodology
+`tools/fidelity_bench.py` exists to avoid.
 
 An earlier comparison against the published plain-int4 H3 was discarded rather than
 reported: that file is broken, and a number against a broken baseline is worse than none.
