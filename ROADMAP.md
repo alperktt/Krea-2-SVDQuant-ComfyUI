@@ -197,10 +197,22 @@ everything else.
 
 ### What would actually settle it
 
-* **Audio.** Still the real complaint and still unmeasured: H3 generates audio in the same
-  forward pass, and `pixel_metrics` is stills only. This needs an audio metric — new
-  machinery, not another run — and it is the one measurement that could still justify the
-  branch after the result above.
+* **Audio — answered, and it is not this repo's problem.** H3 generates audio in the same
+  forward pass, and "4-bit costs audible quality" was the reason to attempt any of this. It
+  does not hold. Same prompt, seed and graph at 832×480×124: the 40 GB **bf16** with the
+  turbo LoRA produces *quieter* audio than the 4-bit build with the same LoRA (RMS −25.9 vs
+  −22.2 dBFS). Quantization is exonerated.
+
+  Two other things were: the prompt, and the LoRA. H3 wants a three-field training caption,
+  and leaving `overall_soundscape` blank produces weak audio on any checkpoint — plain prose
+  produced it on every arm here and looked exactly like a quantization fault. And the turbo
+  LoRAs are `fl2v` (video) against an `fl2va` model: zero audio-specific tensors in them, but
+  audio and video tokens share the same block linears, so a video-only distillation flattens
+  the sound anyway. Dropping the LoRA and sampling 30 steps measures −16.8 dBFS, 5.4 dB above
+  either LoRA arm. Turbo speed and good audio are not currently available together.
+
+  What is still true: there is no audio *fidelity* metric here, so "does the branch help the
+  audio" remains unanswerable. But the premise that sent us looking is gone.
 * **Act-aware calibration.** On Krea 2 this was the large fidelity win (LPIPS 0.3378 →
   0.2825), much larger than rank. No statistics have been captured for H3.
   `svdquant_capture` now matches the union of every architecture's leaves, so it will hook
