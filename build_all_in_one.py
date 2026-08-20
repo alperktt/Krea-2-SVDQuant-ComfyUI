@@ -210,6 +210,20 @@ class StreamingWriter:
             raise RuntimeError("write order does not match the plan: expected {!r}, got {!r}"
                                .format(expected[0], name))
         t = tensor.contiguous().cpu()
+        # Shape and dtype, not just the byte count. The header is written from the *plan*,
+        # so a plan that disagrees with the tensor produces a file whose data is right and
+        # whose header lies -- and readers believe the header. A byte check does not catch
+        # it: [4096] and [4096, 1] are the same 16384 bytes, which is exactly how a
+        # text encoder shipped with its scales declared 2-D when convrot_w4a4 returns them
+        # 1-D, and failed only later, inside a kernel, as "scales: shape [4096, 1] fails:
+        # exactly 1D".
+        if list(t.shape) != expected[2]:
+            raise RuntimeError("{}: planned shape {}, got {}".format(
+                name, expected[2], list(t.shape)))
+        planned_dtype = _DTYPE_STR.get(t.dtype)
+        if planned_dtype != expected[1]:
+            raise RuntimeError("{}: planned dtype {}, got {}".format(
+                name, expected[1], planned_dtype))
         buf = t.view(torch.uint8).reshape(-1) if t.dtype not in (torch.uint8,) else t.reshape(-1)
         data = buf.numpy().tobytes()
         if len(data) != expected[3]:
@@ -265,7 +279,8 @@ def quantize_text_encoder(path: str, fmt: str, groupsize: int, device: str, writ
                 # int4 packs two values per byte along the input dimension; int8 is 1:1.
                 packed = [shape[0], shape[1] // 2] if fmt == "w4a4" else list(shape)
                 writer.plan(out_key, torch.int8, packed)
-                writer.plan(layer + ".weight_scale", torch.float32, [shape[0], 1])
+                writer.plan(layer + ".weight_scale", torch.float32,
+                            _scale_shape(algo, shape[0]))
                 writer.plan(layer + ".comfy_quant", torch.uint8, [_conf_len(algo, groupsize)])
             else:
                 w = handle.get_tensor(key).to(device=device, dtype=torch.bfloat16)
@@ -285,6 +300,26 @@ def _slice_dtype(slice_):
     return {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16,
             "I8": torch.int8, "U8": torch.uint8, "I64": torch.int64,
             "F8_E4M3": torch.float8_e4m3fn}[slice_.get_dtype()]
+
+
+def _scale_shape(algo: str, out_features: int) -> list[int]:
+    """Shape of `weight_scale`, as the layout actually returns it, without quantizing.
+
+    Both algos carry one scale per output channel; they disagree only on the rank.
+    `convrot_w4a4` hands back a 1-D `[out_features]`, and its dequantize kernel constrains
+    the argument to exactly 1-D. `int8_tensorwise` hands back `[out_features, 1]`.
+
+    Hardcoded because the plan pass must not quantize anything -- that is what makes
+    `--dry-run` free and what keeps the two-pass writer honest. The risk of hardcoding is
+    that it drifts from what the layout does; `StreamingWriter.write` closes that by
+    comparing this against the real tensor, so a wrong entry here is a loud failure on the
+    first write rather than a quietly mis-headered checkpoint.
+    """
+    if algo == "convrot_w4a4":
+        return [out_features]
+    if algo == "int8_tensorwise":
+        return [out_features, 1]
+    raise ValueError("no known weight_scale shape for {!r}".format(algo))
 
 
 def _conf_len(algo: str, groupsize: int) -> int:
