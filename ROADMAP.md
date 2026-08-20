@@ -185,6 +185,38 @@ sampling trajectory is chaotic. Treat individual ~0.1 LPIPS gaps here as unresol
 survives the noise is the size of the act-aware effect and rank 256 being clear of
 everything else.
 
+### The verdict from a real clip: INT8 wins, and W4A4 is not worth it here
+
+Everything above was scored on five frames at 640x352 from one prompt. Rendered as an actual
+piece of work -- 15.08 s, 832x480, five shots, two speakers, a 3.6 KB structured prompt, the
+8-step turbo LoRA, seed held -- against `int8_convrot` on the identical graph:
+
+| | W4A4 svdq r256 act-aware | INT8 convrot |
+|---|---|---|
+| size | 13.72 GB | 20.97 GB |
+| render | 530 s | 525 s |
+| picture | **clearly worse** | **clearly better** |
+
+The picture judgement is a human one and it was not close. It also went the opposite way to
+the LPIPS number, which had W4A4 sitting well inside the noise floor against bf16.
+
+**And the speed advantage did not appear.** 530 s against 525 s, on a model whose entire
+reason to exist is that 4-bit activations run faster than the 8-bit path. The likely reason
+is that 21 GB of INT8 plus a 362-frame latent does not fit in 24 GB and streams, paying back
+exactly what the kernel wins — so the comparison would probably separate on a smaller render.
+Not measured, not claimed.
+
+So on this hardware, for this model: **INT8 costs 7 GB more, renders in the same time, and
+looks better.** W4A4 is a working mechanism looking for a model that needs it, and H3 is not
+that model.
+
+**One flaw worth naming before anyone repeats this.** The activation statistics were captured
+at 640x352, with the *4-step* LoRA, from five short prose prompts. The film ran at 832x480
+with the 8-step LoRA and a long structured prompt. Activation distributions depend on
+resolution and prompt, so the branch was calibrated against conditions it was never asked to
+run in. Recapturing at the real inference settings is the one untried thing that could move
+this, and it is not obviously worth the GPU time given the size of the gap.
+
 ### Dead ends, measured
 
 * **`quant_group_size`.** Not a knob: `int4 MMA kernel requires quant_group_size 64`. The
