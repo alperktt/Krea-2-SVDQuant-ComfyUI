@@ -80,32 +80,6 @@ LPIPS against a BF16 reference, so this is a run, not new machinery. Until that 
 honest statement is the one in TROUBLESHOOTING.md: the default changed, the output changed,
 and the new one is at least reproducible.
 
-## 1c. MiniMax H3 (issue #5) — tried, closed, negative
-
-**Status: closed. The mechanism works on H3; the output does not justify it.**
-
-Rendered as actual work — 15.08 s, 832×480, five shots, two speakers, a structured prompt,
-8-step turbo LoRA, seed held — `int8_convrot` is clearly better to look at than a rank-256
-act-aware W4A4 build, finishes in the same time (525 s against 530 s), and costs only 7 GB
-more. The 4-bit activation path's speed advantage did not appear at this size.
-
-Measured along the way and not worth repeating: `quant_group_size` is fixed at 64 by the
-int4 MMA kernel; rank alone decays far too slowly (rank 1024 barely reaches what W4A8 gets
-with no branch); act-aware is the largest lever and still not enough. The audio complaint
-that motivated the attempt turned out to be the prompt schema and the `fl2v` turbo LoRA,
-not quantization — bf16 with the same LoRA is quieter than the 4-bit build.
-
-Four metrics in a row failed to predict the thing they stood in for (PSNR/SSIM, plain
-Frobenius error, then LPIPS — each measured on five frames of one prompt at a resolution
-nobody would ship). That is the transferable lesson.
-
-Full history, numbers and code: tag **`experiment/minimax-h3-w4a4`**. Known flaw if anyone
-retries: the activation statistics were captured at a different resolution, LoRA and prompt
-style than the render they were used for.
-
-What survives in `master` is the architecture registry (`ARCHITECTURES`,
-`detect_architecture`), because item 7 needs the same generalization for the text encoder.
-
 ## 2. Act-aware at ranks other than 256
 
 **Status:** never tried. `--act-stats` shipped after the rank sweep was run, and only a

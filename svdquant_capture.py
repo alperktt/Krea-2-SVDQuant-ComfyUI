@@ -78,9 +78,9 @@ def is_target(name: str) -> bool:
     come from the BF16 model, where no weight is a QuantizedTensor yet.
     """
     # The union across every architecture in `quantize_krea2.ARCHITECTURES`, not one
-    # model's set: this matches against a live module tree, so a name that no model has
-    # simply never appears. Matching the union is what lets the same capture nodes serve
-    # Krea 2 and MiniMax H3 without knowing which one is loaded.
+    # model's set: this matches against a live module tree, so a leaf name no loaded model
+    # has simply never appears. Matching the union is what lets one pair of capture nodes
+    # serve every architecture the quantizer knows, without being told which is loaded.
     return name.startswith("blocks.") and name.endswith(_QUANT_SUFFIXES)
 
 

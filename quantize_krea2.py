@@ -104,31 +104,26 @@ DEFAULT_SEED = 0
 _QUANT_SUFFIXES = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo",
                    "mlp.gate", "mlp.up", "mlp.down")
 
-# MiniMax H3: 50 blocks, four linears each, and Q/K/V arrive fused as one `qkv_proj` rather
-# than split the way Krea 2 has them. `adaln_proj.linear` is deliberately absent -- on the
-# pruned release it is [96768, 8], i.e. eight input channels against a group size of 256,
-# and it is a lookup table rather than a projection.
-_H3_QUANT_SUFFIXES = ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
-
-# What differs between models that this quantizer can handle: the leaf names under
-# `blocks.N.`, how many blocks there are (progress reporting only), and which rank
-# allocations make sense. `gqa` moves budget onto `attn.wk`/`attn.wv`, which only exist as
-# separate tensors on Krea 2 -- there is nothing to move it onto when Q/K/V are fused.
+# What differs between models this quantizer can handle: the leaf names under `blocks.N.`,
+# how many blocks there are (progress reporting only), and which rank allocations apply.
+# One entry today; the table exists because the alternative is a module-level tuple closed
+# over by five functions, which is what had to be undone to support anything else -- see
+# item 7 in ROADMAP.md, whose 4-bit text encoder needs the same parameterization.
+#
+# `gqa` is listed per architecture rather than globally because it moves budget onto
+# `attn.wk`/`attn.wv` specifically, which is a statement about Krea 2's attention layout and
+# not a general one.
 ARCHITECTURES: dict[str, dict] = {
     "krea2": {
         "suffixes": _QUANT_SUFFIXES,
         "blocks": 28,
         "allocs": ("uniform", "gqa"),
     },
-    "minimax_h3": {
-        "suffixes": _H3_QUANT_SUFFIXES,
-        "blocks": 50,
-        "allocs": ("uniform",),
-    },
 }
 
-# The union, for callers that walk a live module tree rather than a checkpoint and can
-# safely match a superset -- only layers that exist get matched. `svdquant_capture` does.
+# The union across every registered architecture, for callers that walk a live module tree
+# rather than a checkpoint and can safely match a superset: a leaf name no loaded model has
+# simply never appears. `svdquant_capture` does exactly that.
 ALL_QUANT_SUFFIXES = tuple(sorted(
     {suf for arch in ARCHITECTURES.values() for suf in arch["suffixes"]}))
 
