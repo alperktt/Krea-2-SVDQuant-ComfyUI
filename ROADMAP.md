@@ -109,23 +109,51 @@ The kernel was never the risk: a plain `convrot_w4a4` H3 already exists publicly
 exactly the config `--format w4a4` writes here (`{"format": "convrot_w4a4",
 "convrot_groupsize": 256}`, 1-D scales). What it does not carry is a low-rank branch.
 
-**What is not established, and it is the whole motivation.** The complaint about 4-bit H3 is
-*audible* degradation — H3 generates audio in the same forward pass as the picture — and the
-low-rank branch is exactly the mechanism that should absorb it. Nothing here measures that:
+### The branch does not pay for itself here — measured, one cell
 
-* No fidelity comparison against the BF16 source, at any rank. `tools/fidelity_bench.py` is
-  paired LPIPS over stills; it has no audio arm and H3 is a video-plus-audio model. Judging
-  this needs an audio metric, which is new machinery rather than another run.
-* The render above is a smoke test — small, short, no turbo LoRA — chosen to answer "does it
-  produce coherent pixels", not "is it better than int4".
-* `ref2va` is untouched. It and `fl2va` fail closed, so it needs its own build.
-* No act-aware capture for H3: `svdquant_capture` now matches the union of every
-  architecture's leaves so it will hook H3 layers, but no statistics have been taken and the
-  Krea 2 rank sweep says nothing about a different model.
+The reason to want SVDQuant on H3 was that plain 4-bit reportedly costs quality, and the
+low-rank branch is the mechanism that absorbs quantization residual. On the picture, at
+rank 64, that did not reproduce.
 
-So: "H3 can be SVDQuantized" is measured. "H3 *should* be SVDQuantized" is not. Until the
-second one has a number behind it, this stays a roadmap entry rather than a download in the
-README.
+Against the 40 GB bf16 source, 4-step turbo LoRA, 640×352, 5 frames, one prompt, one seed,
+mean over frames:
+
+| | PSNR | SSIM | size |
+|---|---|---|---|
+| **noise floor** — two bf16 runs, different seeds | 12.27 dB | 0.3669 | — |
+| svdq rank 64 (branch) | 13.57 dB | 0.4573 | 11.11 GB |
+| w4a4 noLowRank (no branch) | 13.57 dB | 0.4729 | 10.56 GB |
+
+**The branch buys 0.00 dB and costs 0.55 GB.** Both quantized arms sit 1.30 dB above the
+floor, i.e. equally close to bf16, and the branchless one is marginally ahead on SSIM.
+
+Read it with the cautions this repo already applies to its own numbers. The whole
+measurable range here is ~1.3 dB wide, both arms are at the top of it, and this is a single
+cell — one prompt, one seed pair — which is the methodology `tools/fidelity_bench.py` exists
+to avoid. It is enough to say the branch is not obviously earning its bytes on H3 stills;
+it is not enough to say it never will.
+
+An earlier comparison against the published plain-int4 H3 was discarded rather than
+reported: that file is broken, and a number against a broken baseline is worse than none.
+
+### What would actually settle it
+
+* **Audio.** Still the real complaint and still unmeasured: H3 generates audio in the same
+  forward pass, and `pixel_metrics` is stills only. This needs an audio metric — new
+  machinery, not another run — and it is the one measurement that could still justify the
+  branch after the result above.
+* **Act-aware calibration.** On Krea 2 this was the large fidelity win (LPIPS 0.3378 →
+  0.2825), much larger than rank. No statistics have been captured for H3.
+  `svdquant_capture` now matches the union of every architecture's leaves, so it will hook
+  H3's layers; nobody has run it.
+* **A real bench.** Multiple prompts and seeds, paired, the way Test 3 was run.
+* **`ref2va`.** Untouched. It and `fl2va` fail closed, so it needs its own build.
+
+So: "H3 can be SVDQuantized" is measured and true. "H3 *should* be" currently has one
+measurement pointing at no, on the half of the model that was never the complaint. Until
+that is resolved, this stays a roadmap entry and **no H3 checkpoint is published or listed
+in the README** — the branchless `--format w4a4` build is the one that looks worth having,
+and it needs no code from this repo to load.
 
 ## 2. Act-aware at ranks other than 256
 
