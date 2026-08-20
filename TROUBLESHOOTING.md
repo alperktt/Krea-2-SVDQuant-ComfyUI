@@ -124,30 +124,51 @@ too. The diagnostics node prints your pinned-memory budget under `mode=env`.
 
 ## Iteration time jumps to 30-100 s once VRAM passes ~12 GB (and FP8/INT8 do not)
 
-Real, known, and not your setup. The `svdq` loader opts the model out of ComfyUI's dynamic VRAM
-management: `load_svdquant_w4a4` passes `disable_dynamic=True`, which pins the model to the
-classic `ModelPatcher`. The stock `UNETLoader` does not do that, so the FP8, INT8 and
-`noLowRank` checkpoints get the streaming patcher and the `svdq` ones do not. Past the point
-where the model no longer fits, the pinned path falls back to streaming weights per module per
-step, and a ~1 s iteration becomes 30-100 s.
+**Fixed.** If you are on a build that still does this, update.
 
-Two things make an svdq file cross that line earlier than a same-format file: the low-rank
-branch is real memory (~645 MB at rank 256, ~160 MB at rank 64) on top of the checkpoint, and
-the rank-256 build is 9.10 GB against 7.50 GB for `noLowRank`.
+The `svdq` loader used to opt the model out of ComfyUI's dynamic VRAM management:
+`load_svdquant_w4a4` passed `disable_dynamic=True`, which pinned it to the classic
+`ModelPatcher`. The stock `UNETLoader` does not do that, so the FP8, INT8 and `noLowRank`
+checkpoints got the streaming patcher and the `svdq` ones did not. Past the point where the
+model no longer fits, the pinned path falls back to streaming weights per module per step,
+and a ~1 s iteration becomes 30-100 s. Nothing about the quantization was involved — it was
+which patcher the loader asked for.
 
-On a 12 GB card, in order of preference:
+Both loaders now default to whatever ComfyUI would do for any other model, which on an
+ordinary launch is the dynamic patcher. The **status output** on the loader node says which
+one you got:
 
-1. **`Krea2-Turbo-W4A4-noLowRank.safetensors`** (7.50 GB). Loads with the stock `UNETLoader`, so
-   it gets dynamic VRAM, and it is ~9% faster per step than any rank. You give up the low-rank
-   branch's fidelity.
-2. **`Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors`** (7.90 GB). 1.2 GB smaller than rank 256
-   and statistically identical to it *as long as you never load a LoRA*.
-3. Keep the resolution and batch size under whatever puts you over the edge, and watch the
-   loader's `model_size` line — it reports the real number, branch included.
+```
+w4a4 + low-rank: attached 224 branches (rank 256, variant turbo), model_size 9.10 GiB,
+ModelPatcherDynamic (dynamic vram: on), compile: 224 layers in-graph via krea2::w4a4_linear
+```
 
-The pin is deliberate, not an oversight: the dynamic patcher takes ownership of the weights, and
-that path has never been validated against the branch buffers. Lifting it is
-[item 1 on the roadmap](ROADMAP.md), with the two conditions that have to hold first.
+`ModelPatcher (dynamic vram: off)` there means you are on the old path — either you set
+`vram_management` to `classic`, or ComfyUI itself has dynamic VRAM off (`--highvram`,
+`--novram`, `--gpu-only`, `--cpu`, `--disable-dynamic-vram`, or no working `comfy-aimdo`
+install; the startup log says `DynamicVRAM support detected and enabled` when it is on).
+
+### If you need the old behaviour back
+
+One thing here is genuinely unmeasured: the streaming patcher moves the low-rank branch
+buffers with a plain device copy rather than through its own allocator, so at rank 256 there
+is 1.6 GiB of real VRAM its internal bookkeeping does not account for. If that turns out to
+bite on your card, set the loader's **`vram_management`** input to `classic`, or run the
+whole server with `KREA2_DISABLE_DYNAMIC=1`. Please open an issue if you have to — that is
+the case this escape hatch exists to hear about.
+
+### Still tight on a 12 GB card
+
+The branch is real memory on top of the checkpoint — measured off the published files,
+1.6 GiB at rank 256 and 0.4 GiB at rank 64 across the 224 blocks — and the rank-256 build is
+9.10 GB against 7.50 GB for `noLowRank`. So the older advice still holds as a *size*
+argument, just no longer as a workaround for a 30x slowdown:
+
+1. **`Krea2-Turbo-W4A4-noLowRank.safetensors`** (7.50 GB) is ~9% faster per step than any
+   rank, and gives up the low-rank branch's fidelity.
+2. **`Krea2-Turbo-SVDQuant-W4A4-rank64.safetensors`** (7.90 GB) is 1.2 GB smaller than rank
+   256 and statistically identical to it *as long as you never load a LoRA*.
+3. Watch the loader's `model_size` line — it reports the real number, branch included.
 
 ## Out of memory on a small card (and int8 works fine)
 
@@ -155,9 +176,9 @@ Fixed. The low-rank factors were attached as non-persistent buffers, which Comfy
 `module_size()` — the basis of every VRAM decision, including the lowvram split — could
 not see, while `.to(device)` moved them anyway. Worse, the old branch cached its own
 device move back onto the module, so once ComfyUI offloaded a layer the factors quietly
-came back to the GPU and stayed there, outside all accounting. About 645 MB at rank 64,
-which is the difference between fitting and not on an 8 GB card. INT8 checkpoints carry no
-branch, so they were never affected.
+came back to the GPU and stayed there, outside all accounting. 0.4 GiB at rank 64 and
+1.6 GiB at rank 256, which is the difference between fitting and not on an 8 GB card. INT8
+checkpoints carry no branch, so they were never affected.
 
 They are now published into `state_dict()` under their own `svdq_l1` / `svdq_l2` keys and
 staged per call via `comfy.model_management.cast_to`, so they are budgeted and offloaded

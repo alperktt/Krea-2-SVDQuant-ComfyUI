@@ -11,31 +11,37 @@ down gets run twice.
 
 ## 1. Let the svdq loader use ComfyUI's dynamic patcher
 
-**Status:** reported from the field, cause identified, not fixed. The highest-value item here,
-because it is the difference between "works" and "unusable" on a 12 GB card.
+**Status: done.** `disable_dynamic=True` is gone from both loaders; they default to whatever
+ComfyUI would do for any other model, which on an ordinary launch is `ModelPatcherDynamic`.
+The `vram_management` input (and `KREA2_DISABLE_DYNAMIC=1`) restores the pin.
 
-`load_svdquant_w4a4` passes `disable_dynamic=True`
-([svdquant_w4a4.py](svdquant_w4a4.py)), which pins the model to the classic `ModelPatcher` and
-opts it out of dynamic VRAM management. The stock `UNETLoader` does not, so the FP8, INT8 and
-`noLowRank` checkpoints get the streaming patcher and the `svdq` ones do not — which is exactly
-the asymmetry users report: past ~12 GB the svdq files fall to per-step weight streaming and
-iteration time goes from ~1 s to 30-100 s, while the branchless files of the same size are
-fine.
+The pin was waiting on two conditions. Both hold on current ComfyUI, checked against the
+source rather than assumed:
 
-The pin is deliberate and documented: `ModelPatcherDynamic` takes ownership of the weights via
-`load_model_weights(..., assign=patcher.is_dynamic())`, and that path has never been validated
-against the low-rank branch buffers. Two things have to hold before the flag can come off:
+1. **The branch buffers survive the streaming patcher.** `ModelPatcherDynamic.load()` ends
+   by walking `self.model.named_buffers(recurse=True)`, moving every buffer to the load
+   device with `set_attr_buffer` and stashing the original in `self.backup_buffers`. So
+   `svdq_l1`/`svdq_l2` end up resident on the GPU and `add_low_rank`'s `cast_to` is a no-op
+   — the opposite of the feared per-step multi-MB staging copy. Unload is symmetric:
+   `partially_unload()` falls through to `restore_loaded_backups()`, which puts them back.
+2. **`module_size()` still counts them.** `_load_list()` derives its per-module budget from
+   `comfy.model_management.module_size`, which sums `state_dict()` — exactly what
+   `_publish_in_state_dict` exists to feed. The 1.6 GiB at rank 256 is visible to the
+   budget.
 
-1. The `svdq_l1`/`svdq_l2` buffers survive the streaming patcher's assignment and stay on the
-   device the layer's input is on, or `add_low_rank`'s `cast_to` starts copying ~2.9 MB per
-   layer per step.
-2. `module_size()` still counts them. That is what `_publish_in_state_dict` exists for, and a
-   patcher that builds its own size accounting may not go through `state_dict()` at all —
-   uncounted, they are ~645 MB at rank 256 that the VRAM budget believes is free.
+Two things that also had to be true and are:
 
-Until then the honest workaround for a 12 GB card is `Krea2-Turbo-W4A4-noLowRank` (7.50 GB,
-stock loader, ~9% faster per step) or the rank-64 build (7.90 GB), which measures the same as
-rank 256 as long as no LoRA is loaded.
+* The compile fast path self-disables rather than reading a stale weight. Under the dynamic
+  patcher the resident copy lives in `_v_weight`/`_prefetch` while `module.weight` stays on
+  the host, so `_install_custom_op`'s per-call `weight._qdata.device != x.device` check
+  sends the call to the stock forward. Correct, at the cost of the in-graph op — which only
+  matters under `TorchCompileModel`.
+* The LoRA node is unaffected: it works through `add_object_patch`, and
+  `ModelPatcherDynamic.patch_model` delegates object patches to `super()`.
+
+**What is still open:** the buffers are moved with a plain device copy, outside the dynamic
+allocator's `allocated_size` accounting. Real VRAM, invisible bookkeeping. That is why the
+escape hatch shipped with the fix rather than the fix shipping alone.
 
 ## 2. Act-aware at ranks other than 256
 
