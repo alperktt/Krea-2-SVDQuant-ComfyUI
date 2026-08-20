@@ -248,7 +248,24 @@ class Krea2SVDQuantCaptureSave:
         return float("nan")
 
     def save(self, latent, filename, keep_capturing):
-        path = os.path.join(folder_paths.get_output_directory(), filename)
+        # Relative to ComfyUI/output/, which is what the tooltip promises. `os.path.join`
+        # alone does not keep that promise: hand it an absolute path and it discards the
+        # first argument, and `write()` then happily creates whatever directory it names.
+        # The sibling Quantize node already resolves `act_stats` this way, so make the two
+        # agree about what a bare filename means.
+        filename = filename.strip()
+        if not filename:
+            raise ValueError("filename is empty")
+        if os.path.isabs(filename) or os.path.splitdrive(filename)[0]:
+            raise ValueError(
+                "filename must be relative to ComfyUI/output/, got an absolute path: {}"
+                .format(filename))
+        out_dir = folder_paths.get_output_directory()
+        path = os.path.normpath(os.path.join(out_dir, filename))
+        if os.path.commonpath([os.path.abspath(out_dir), os.path.abspath(path)]) != \
+                os.path.abspath(out_dir):
+            raise ValueError(
+                "filename must stay under ComfyUI/output/, got: {}".format(filename))
         info = write(path)
         if not keep_capturing:
             detach()

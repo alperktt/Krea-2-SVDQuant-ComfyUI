@@ -494,7 +494,12 @@ class Krea2SVDQuantQuantizeAllInOne:
                 try:
                     os.remove(temp_dit)
                 except Exception:
-                    pass
+                    # Not worth failing the run over -- the checkpoint is already written --
+                    # but ~8 GB staying behind in the temp directory is worth one line,
+                    # because nothing else will ever mention it.
+                    logging.warning(
+                        "[krea2-svdquant] could not delete the intermediate %s; roughly "
+                        "8 GB is still there", temp_dit, exc_info=True)
 
         hint = SAMPLER_HINTS.get(variant)
         loader = ("Krea2 SVDQuant Checkpoint Loader" if rank else "CheckpointLoaderSimple")

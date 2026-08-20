@@ -28,14 +28,15 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))                 # the node package
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(HERE))))  # ComfyUI root
 
 import torch  # noqa: E402
 
-import comfy.lora  # noqa: E402
-import comfy.utils  # noqa: E402
-import comfy.weight_adapter  # noqa: E402
-
+# `quantize_krea2` before `comfy.*`, and that order is the point. It runs
+# `_find_comfyui_root()` at import -- $COMFYUI_PATH, then two levels up from itself, then a
+# couple of fallbacks -- so importing it is what puts ComfyUI on the path. This file used to
+# do that itself with a bare `dirname(dirname(dirname(HERE)))`, which is correct only when
+# the pack sits in `ComfyUI/custom_nodes/`: from a working copy anywhere else, even `--help`
+# died on `No module named 'comfy'` with nothing to say about why.
 from quantize_krea2 import (  # noqa: E402
     LAYER_PREFIXES,
     convert,
@@ -43,6 +44,10 @@ from quantize_krea2 import (  # noqa: E402
     detect_prefix,
     resolve_format,
 )
+
+import comfy.lora  # noqa: E402
+import comfy.utils  # noqa: E402
+import comfy.weight_adapter  # noqa: E402
 
 _PREFIX = "diffusion_model."
 _ALT_PREFIX = "transformer."
