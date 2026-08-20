@@ -80,6 +80,53 @@ LPIPS against a BF16 reference, so this is a run, not new machinery. Until that 
 honest statement is the one in TROUBLESHOOTING.md: the default changed, the output changed,
 and the new one is at least reproducible.
 
+## 1c. MiniMax H3 (issue #5): quantizes, loads and renders — quality unmeasured
+
+**Status: the mechanism works end to end; the reason to want it is still unproven.**
+
+`quantize_krea2.py` only ever knew one Krea 2 thing: which leaf names under `blocks.N.` are
+worth quantizing, as a module-level tuple five functions closed over. That is now
+`ARCHITECTURES`, detected from the checkpoint by `detect_architecture()`. Krea 2 is eight
+leaves over 28 blocks; MiniMax H3 is four over 50 (`attn.qkv_proj`, `attn.out_proj`,
+`mlp.fc1`, `mlp.fc2` — Q/K/V arrive fused, which is also why `--rank-alloc gqa` is refused
+there: it is defined over `attn.wk`/`attn.wv`, which H3 does not have as separate tensors).
+This is the same generalization item 7 needs for the text encoder.
+
+Measured, from `Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16`
+(40.2 GB, already in ComfyUI's own layout, so no key conversion is needed at all):
+
+| | |
+|---|---|
+| build | 200/200 layers, rank 64, refine 100, **11.11 GB from 37.46 GB, 185 s** |
+| load | `MiniMaxH3Model`, 200/200 branches attached, `ModelPatcherDynamic` |
+| kernel | `cuda (comfy_kitchen.backends.cuda.convrot_w4a4_linear)` |
+| render | 640×352, 5 frames, 20 steps, no turbo LoRA — coherent frames |
+
+Branch cost on H3, computed from the real shapes: rank 64 is 0.56 GiB over a 8.97 GiB
+4-bit body (6%), rank 256 is 2.22 GiB (25%) — the same proportion Krea 2 pays.
+
+The kernel was never the risk: a plain `convrot_w4a4` H3 already exists publicly and carries
+exactly the config `--format w4a4` writes here (`{"format": "convrot_w4a4",
+"convrot_groupsize": 256}`, 1-D scales). What it does not carry is a low-rank branch.
+
+**What is not established, and it is the whole motivation.** The complaint about 4-bit H3 is
+*audible* degradation — H3 generates audio in the same forward pass as the picture — and the
+low-rank branch is exactly the mechanism that should absorb it. Nothing here measures that:
+
+* No fidelity comparison against the BF16 source, at any rank. `tools/fidelity_bench.py` is
+  paired LPIPS over stills; it has no audio arm and H3 is a video-plus-audio model. Judging
+  this needs an audio metric, which is new machinery rather than another run.
+* The render above is a smoke test — small, short, no turbo LoRA — chosen to answer "does it
+  produce coherent pixels", not "is it better than int4".
+* `ref2va` is untouched. It and `fl2va` fail closed, so it needs its own build.
+* No act-aware capture for H3: `svdquant_capture` now matches the union of every
+  architecture's leaves so it will hook H3 layers, but no statistics have been taken and the
+  Krea 2 rank sweep says nothing about a different model.
+
+So: "H3 can be SVDQuantized" is measured. "H3 *should* be SVDQuantized" is not. Until the
+second one has a number behind it, this stays a roadmap entry rather than a download in the
+README.
+
 ## 2. Act-aware at ranks other than 256
 
 **Status:** never tried. `--act-stats` shipped after the rank sweep was run, and only a

@@ -24,9 +24,10 @@ import comfy.sd
 import comfy.utils
 import folder_paths
 
-from .quantize_krea2 import detect_prefix
+from .quantize_krea2 import detect_architecture, detect_prefix
 from .sage_mask_guard import install_mask_guard
-from .svdquant_diag import BUF_L1, BUF_L2, _CATEGORY, branch_factors, log_dispatch  # noqa: F401
+from .svdquant_diag import (BUF_L1, BUF_L2, _CATEGORY, branch_factors,  # noqa: F401
+                            log_dispatch, quantized_linears)
 
 # The checkpoint keys are the buffer names with a dot in front -- derived rather than
 # retyped, because the two being identical is the property the round-trip depends on.
@@ -398,6 +399,24 @@ def _install_custom_op(module: torch.nn.Module) -> bool:
     return True
 
 
+def _detect_arch(branches, layer_prefix: str) -> str:
+    """Which architecture these layer names belong to, or "unknown".
+
+    `quantize_krea2.detect_architecture` wants checkpoint keys; the loader has module paths,
+    so they are given the `.weight` suffix it looks for. Never fatal: a checkpoint this
+    cannot name still loads and still gets its branches -- the only thing riding on the
+    answer is whether Krea 2's sage guard is installed, and guessing wrong there should not
+    cost anyone a load.
+    """
+    try:
+        keys = ["{}.weight".format(name) for name in branches]
+        return detect_architecture(keys, layer_prefix)
+    except Exception as exc:
+        logging.info("[krea2-svdquant] could not name this architecture (%s); "
+                     "skipping architecture-specific setup", exc)
+        return "unknown"
+
+
 def _patcher_desc(patcher) -> str:
     """Which patcher this model got, for the load summary.
 
@@ -416,7 +435,7 @@ def _patcher_desc(patcher) -> str:
 
 def _attach_svdq_branches(patcher, branches: dict[str, dict[str, torch.Tensor]],
                          layer_prefix: str, metadata: dict | None, path: str,
-                         compile_safe: bool = True) -> str:
+                         compile_safe: bool = True, arch: str = "krea2") -> str:
     diffusion_model = patcher.model.diffusion_model
     model_dtype = patcher.model.get_dtype()
     attached = 0
@@ -471,7 +490,11 @@ def _attach_svdq_branches(patcher, branches: dict[str, dict[str, torch.Tensor]],
     # so drop the cache and let `model_size()` re-derive it from the state dict.
     patcher.size = 0
 
-    install_mask_guard(patcher)
+    # Krea 2 only -- see `sage_mask_guard`'s docstring, whose whole argument is about Krea 2's
+    # ref_boost mask and its 12-token txtfusion attention. Another architecture gets no guard
+    # until someone measures that it needs one.
+    if arch == "krea2":
+        install_mask_guard(patcher)
 
     # Metadata is a newer addition; checkpoints published before it still load, with the
     # rank recovered from the factor shape exactly as before. The shapes are the ground
@@ -543,7 +566,8 @@ def load_svdquant_w4a4(path: str, model_options: dict | None = None,
     if patcher is None:
         raise RuntimeError("could not detect a model in {}".format(path))
 
-    _attach_svdq_branches(patcher, branches, layer_prefix, metadata, path, compile_safe)
+    _attach_svdq_branches(patcher, branches, layer_prefix, metadata, path, compile_safe,
+                          arch=_detect_arch(branches, layer_prefix))
     return patcher
 
 
@@ -585,10 +609,12 @@ def load_svdquant_checkpoint(path: str, output_vae: bool = True, output_clip: bo
 
     if branches:
         layer_prefix = detect_prefix(branches.keys(), default="")
-        _attach_svdq_branches(patcher, branches, layer_prefix, metadata, path, compile_safe)
+        _attach_svdq_branches(patcher, branches, layer_prefix, metadata, path, compile_safe,
+                              arch=_detect_arch(branches, layer_prefix))
     else:
         diffusion_model = patcher.model.diffusion_model
-        install_mask_guard(patcher)
+        if _detect_arch({n: None for n, _ in quantized_linears(diffusion_model)}, "") == "krea2":
+            install_mask_guard(patcher)
         dispatch = log_dispatch(diffusion_model)
         summary = "all-in-one checkpoint (branchless): model_size {:.2f} GiB, {}".format(
             patcher.model_size() / 1024 ** 3, _patcher_desc(patcher))

@@ -104,6 +104,70 @@ DEFAULT_SEED = 0
 _QUANT_SUFFIXES = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo",
                    "mlp.gate", "mlp.up", "mlp.down")
 
+# MiniMax H3: 50 blocks, four linears each, and Q/K/V arrive fused as one `qkv_proj` rather
+# than split the way Krea 2 has them. `adaln_proj.linear` is deliberately absent -- on the
+# pruned release it is [96768, 8], i.e. eight input channels against a group size of 256,
+# and it is a lookup table rather than a projection.
+_H3_QUANT_SUFFIXES = ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
+
+# What differs between models that this quantizer can handle: the leaf names under
+# `blocks.N.`, how many blocks there are (progress reporting only), and which rank
+# allocations make sense. `gqa` moves budget onto `attn.wk`/`attn.wv`, which only exist as
+# separate tensors on Krea 2 -- there is nothing to move it onto when Q/K/V are fused.
+ARCHITECTURES: dict[str, dict] = {
+    "krea2": {
+        "suffixes": _QUANT_SUFFIXES,
+        "blocks": 28,
+        "allocs": ("uniform", "gqa"),
+    },
+    "minimax_h3": {
+        "suffixes": _H3_QUANT_SUFFIXES,
+        "blocks": 50,
+        "allocs": ("uniform",),
+    },
+}
+
+# The union, for callers that walk a live module tree rather than a checkpoint and can
+# safely match a superset -- only layers that exist get matched. `svdquant_capture` does.
+ALL_QUANT_SUFFIXES = tuple(sorted(
+    {suf for arch in ARCHITECTURES.values() for suf in arch["suffixes"]}))
+
+
+def detect_architecture(keys, prefix: str) -> str:
+    """Which entry in `ARCHITECTURES` this checkpoint's block leaves look like.
+
+    Scored by how many distinct leaves each candidate matches, so a model that happens to
+    share one name with another does not win on that alone. Ties and zero-matches raise,
+    with the observed leaves in the message -- the alternative is quantizing nothing and
+    writing a full-size file that does nothing, which is the failure this whole family of
+    checks exists to prevent.
+    """
+    observed = set()
+    head = "{}blocks.".format(prefix)
+    for key in keys:
+        if not key.endswith(".weight") or not key.startswith(head):
+            continue
+        leaf = leaf_name(key[: -len(".weight")], prefix)
+        if leaf is not None:
+            observed.add(leaf)
+
+    scores = {name: len(observed & set(spec["suffixes"]))
+              for name, spec in ARCHITECTURES.items()}
+    best = max(scores.values()) if scores else 0
+    if best == 0:
+        raise RuntimeError(
+            "no known architecture matches this checkpoint. Nothing under '{}blocks.' ends "
+            "in a leaf name any of {} expects.\n  observed leaves: {}".format(
+                prefix, ", ".join(sorted(ARCHITECTURES)),
+                ", ".join(sorted(observed)) or "none"))
+    winners = [n for n, sc in scores.items() if sc == best]
+    if len(winners) > 1:
+        raise RuntimeError(
+            "checkpoint matches {} equally well ({} leaves each); cannot tell them "
+            "apart.\n  observed leaves: {}".format(
+                " and ".join(sorted(winners)), best, ", ".join(sorted(observed))))
+    return winners[0]
+
 
 # Checkpoints ship either bare ("blocks.0...") or prefixed ("model.diffusion_model.blocks.0...").
 LAYER_PREFIXES = ("model.diffusion_model.", "diffusion_model.", "")
@@ -138,7 +202,7 @@ def detect_prefix(keys, default: str | None = None) -> str:
     )
 
 
-def check_requantizable(handle, keys, prefix: str) -> None:
+def check_requantizable(handle, keys, prefix: str, suffixes=None) -> None:
     """Make sure every target layer that's already quantized is something we can
     dequantize back to BF16 (see `_DEQUANTIZABLE_FORMATS`). Anything else -- most
     importantly INT8/W4A4 -- needs the original BF16 (or FP16) release instead.
@@ -147,7 +211,7 @@ def check_requantizable(handle, keys, prefix: str) -> None:
         if not key.endswith(".comfy_quant"):
             continue
         layer = key[: -len(".comfy_quant")]
-        if not is_target(layer, prefix):
+        if not is_target(layer, prefix, suffixes):
             continue
         conf = json.loads(bytes(handle.get_tensor(key).tolist()))
         fmt = conf.get("format")
@@ -174,11 +238,15 @@ def dequantize_target_weight(handle, layer: str, device: str) -> torch.Tensor:
     return weight.to(torch.bfloat16)
 
 
-def is_target(layer: str, prefix: str) -> bool:
-    """Only the transformer blocks; txtfusion and friends stay high precision."""
+def is_target(layer: str, prefix: str, suffixes=None) -> bool:
+    """Only the transformer blocks; txtfusion and friends stay high precision.
+
+    `suffixes` defaults to Krea 2's set so existing callers keep their behaviour; `convert`
+    passes the detected architecture's.
+    """
     if not layer.startswith("{}blocks.".format(prefix)):
         return False
-    return any(layer.endswith(s) for s in _QUANT_SUFFIXES)
+    return any(layer.endswith(s) for s in (suffixes or _QUANT_SUFFIXES))
 
 
 def leaf_name(layer: str, prefix: str) -> str | None:
@@ -254,18 +322,24 @@ RANK_ALLOCATIONS: dict[str, dict[str, float] | None] = {
 }
 
 
-def leaf_ranks(rank: int, rank_alloc: str = "uniform") -> dict[str, int]:
-    """Expand a rank budget into a per-leaf rank, one entry per name in `_QUANT_SUFFIXES`.
+def leaf_ranks(rank: int, rank_alloc: str = "uniform", suffixes=None) -> dict[str, int]:
+    """Expand a rank budget into a per-leaf rank, one entry per leaf name.
 
     `uniform` gives every leaf the same rank -- the historical behaviour. Other allocations
     redistribute the same total branch bytes according to `RANK_ALLOCATIONS`.
     """
+    suffixes = suffixes or _QUANT_SUFFIXES
     if rank_alloc not in RANK_ALLOCATIONS:
         raise RuntimeError("unknown rank allocation {!r}; expected one of {}".format(
             rank_alloc, ", ".join(sorted(RANK_ALLOCATIONS))))
     mults = RANK_ALLOCATIONS[rank_alloc]
     if mults is None:
-        return {leaf: rank for leaf in _QUANT_SUFFIXES}
+        return {leaf: rank for leaf in suffixes}
+    missing = [leaf for leaf in suffixes if leaf not in mults]
+    if missing:
+        raise RuntimeError(
+            "rank allocation {!r} has no entry for {}; it was written for a different "
+            "architecture.".format(rank_alloc, ", ".join(sorted(missing))))
 
     # Byte-neutrality is the whole point of a non-uniform allocation, and it only survives
     # while every leaf can be expressed on the step-8 grid. Below that the smallest leaves get
@@ -282,7 +356,7 @@ def leaf_ranks(rank: int, rank_alloc: str = "uniform") -> dict[str, int]:
             .format(rank_alloc, minimum, rank, smallest, _RANK_STEP))
 
     out = {}
-    for leaf in _QUANT_SUFFIXES:
+    for leaf in suffixes:
         out[leaf] = int(round(rank * mults[leaf] / _RANK_STEP)) * _RANK_STEP
     return out
 
@@ -546,7 +620,7 @@ def load_act_stats(path: str) -> dict[str, torch.Tensor]:
     return stats
 
 
-def check_act_stats_coverage(stats: dict, keys, prefix: str, ranks: dict) -> None:
+def check_act_stats_coverage(stats: dict, keys, prefix: str, ranks: dict, suffixes=None) -> None:
     """Fail before any GPU work if the statistics don't cover every layer that will branch.
 
     Partial statistics are the quiet-wrongness case: the covered layers would get an
@@ -564,7 +638,7 @@ def check_act_stats_coverage(stats: dict, keys, prefix: str, ranks: dict) -> Non
         if not key.endswith(".weight"):
             continue
         layer = key[: -len(".weight")]
-        if not is_target(layer, prefix):
+        if not is_target(layer, prefix, suffixes):
             continue
         if rank_for_leaf(ranks, leaf_name(layer, prefix)) <= 0:
             continue
@@ -609,7 +683,6 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     kept = 0
     branched = 0
     observed_leaves: set[str] = set()
-    ranks = leaf_ranks(rank, rank_alloc) if rank > 0 else {}
     used_ranks: set[int] = set()
     clamped: dict[str, int] = {}
     stats = load_act_stats(act_stats) if act_stats else {}
@@ -618,9 +691,27 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     with safe_open(src, framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
         prefix = detect_prefix(keys)
-        check_requantizable(handle, keys, prefix)
+        # Which model this is decides the leaf names, and therefore everything downstream:
+        # what counts as a target, how a rank budget is spread, and how many layers the
+        # progress bar is counting towards. Detected rather than passed, because the
+        # checkpoint already knows and an argument would be one more thing to get wrong.
+        arch = detect_architecture(keys, prefix)
+        suffixes = ARCHITECTURES[arch]["suffixes"]
+        expected_layers = ARCHITECTURES[arch]["blocks"] * len(suffixes)
+        allowed = ARCHITECTURES[arch]["allocs"]
+        if rank_alloc not in allowed:
+            raise RuntimeError(
+                "rank allocation {!r} does not apply to {}: it is defined over {}'s leaf "
+                "names. Available here: {}.".format(
+                    rank_alloc, arch,
+                    "krea2" if rank_alloc in ARCHITECTURES["krea2"]["allocs"] else "another model",
+                    ", ".join(allowed)))
+        ranks = leaf_ranks(rank, rank_alloc, suffixes) if rank > 0 else {}
+        print("architecture: {} ({} leaf names, {} blocks expected)".format(
+            arch, len(suffixes), ARCHITECTURES[arch]["blocks"]))
+        check_requantizable(handle, keys, prefix, suffixes)
         if stats:
-            check_act_stats_coverage(stats, keys, prefix, ranks)
+            check_act_stats_coverage(stats, keys, prefix, ranks, suffixes)
 
         # Companion keys (old scales/markers) for target layers get regenerated fresh
         # when we process the ".weight" key below -- skip the stale copies on disk,
@@ -629,7 +720,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
         for key in keys:
             if key.endswith(".weight"):
                 layer = key[: -len(".weight")]
-                if is_target(layer, prefix):
+                if is_target(layer, prefix, suffixes):
                     for suffix in ("weight_scale", "weight_scale_2", "input_scale", "comfy_quant"):
                         stale_companions.add("{}.{}".format(layer, suffix))
 
@@ -639,7 +730,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                 leaf = leaf_name(layer, prefix)
                 if leaf is not None:
                     observed_leaves.add(leaf)
-                if is_target(layer, prefix):
+                if is_target(layer, prefix, suffixes):
                     w = dequantize_target_weight(handle, layer, device)
                     if weight_patch is not None:
                         w = weight_patch(key, w)
@@ -678,7 +769,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
                     del w, qdata, scales
                     quantized += 1
                     if progress_cb is not None:
-                        progress_cb(quantized, _EXPECTED_LAYERS,
+                        progress_cb(quantized, expected_layers,
                                     "quantized {} layers ({:.0f}s)".format(
                                         quantized, time.time() - t0))
                     if quantized % 32 == 0:
@@ -700,13 +791,13 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
     if quantized == 0:
         raise RuntimeError(
             "Found the transformer blocks but quantized nothing: no layer under "
-            "'{}blocks.' ends in one of the expected leaf names.\n"
-            "  expected: {}\n"
-            "  observed: {}\n"
-            "This is a Krea 2 variant with different layer naming; quantize_krea2.py "
+            "'{0}blocks.' ends in one of the expected leaf names.\n"
+            "  expected: {1}\n"
+            "  observed: {2}\n"
+            "This is a {3} variant with different layer naming; quantize_krea2.py "
             "would otherwise have written a full-size file that does nothing."
-            .format(prefix, ", ".join(sorted(_QUANT_SUFFIXES)),
-                    ", ".join(sorted(observed_leaves)) or "none")
+            .format(prefix, ", ".join(sorted(suffixes)),
+                    ", ".join(sorted(observed_leaves)) or "none", arch)
         )
 
     # A leaf can only be clamped when the allocation asked for more rank than the weight is
@@ -757,7 +848,7 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
         "krea2_svdquant_device": str(device),
     }
     if progress_cb is not None:
-        progress_cb(quantized, _EXPECTED_LAYERS, "writing {:.2f} GB ...".format(
+        progress_cb(quantized, expected_layers, "writing {:.2f} GB ...".format(
             sum(t.numel() * t.element_size() for t in out.values()) / 1024 ** 3))
     save_file(out, dst, metadata=metadata)
     size = os.path.getsize(dst) / 1024 ** 3
@@ -776,7 +867,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
 
 # The Krea 2 block count, used only to scale a progress bar. A variant with a different
 # depth still quantizes correctly; the bar is just less accurate.
-_EXPECTED_LAYERS = 28 * len(_QUANT_SUFFIXES)
+# Layer counts are per-architecture now (`ARCHITECTURES[...]["blocks"]`); `convert` derives
+# `expected_layers` from the detected one. The old module-level constant hardcoded 28 blocks
+# of Krea 2 and would have quietly mis-scaled the progress bar on any other model.
 
 _FORMAT_ALIASES = {
     "int8": "int8_tensorwise",

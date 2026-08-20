@@ -30,7 +30,7 @@ import torch
 
 import folder_paths
 
-from .quantize_krea2 import _QUANT_SUFFIXES
+from .quantize_krea2 import ALL_QUANT_SUFFIXES as _QUANT_SUFFIXES
 from .svdquant_diag import _CATEGORY
 
 # layer name -> {"sumsq": float64 [in_features] on cpu, "count": int}
@@ -77,6 +77,10 @@ def is_target(name: str) -> bool:
     Deliberately *not* keyed on the weight being quantized: the statistics are supposed to
     come from the BF16 model, where no weight is a QuantizedTensor yet.
     """
+    # The union across every architecture in `quantize_krea2.ARCHITECTURES`, not one
+    # model's set: this matches against a live module tree, so a name that no model has
+    # simply never appears. Matching the union is what lets the same capture nodes serve
+    # Krea 2 and MiniMax H3 without knowing which one is loaded.
     return name.startswith("blocks.") and name.endswith(_QUANT_SUFFIXES)
 
 
