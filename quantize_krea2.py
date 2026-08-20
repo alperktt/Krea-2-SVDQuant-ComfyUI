@@ -592,6 +592,13 @@ def _quantize_raw(weight: torch.Tensor, fmt: str, groupsize: int):
         qdata, params = layout.quantize(weight, convrot_groupsize=groupsize)
         conf = {"format": "convrot_w4a4", "convrot_groupsize": groupsize,
                 "linear_dtype": getattr(params, "linear_dtype", "int4")}
+    elif fmt == "asym_w4a8_int8":
+        # 4-bit weights, 8-bit activations. The weight side is finer-grained than
+        # convrot_w4a4 (group_size 16 against an in-features-wide scale) and carries a
+        # codebook; the activation side is the point.
+        qdata, params = layout.quantize(weight, convrot_groupsize=groupsize)
+        conf = {"format": "asym_w4a8_int8", "group_size": params.group_size,
+                "convrot_groupsize": groupsize}
     elif fmt == "float8_e4m3fn":
         qdata, params = layout.quantize(weight, scale="recalculate")
         conf = {"format": "float8_e4m3fn"}
@@ -602,6 +609,19 @@ def _quantize_raw(weight: torch.Tensor, fmt: str, groupsize: int):
 
 def quantize_weight(weight: torch.Tensor, fmt: str, groupsize: int):
     qdata, params, _, conf = _quantize_raw(weight, fmt, groupsize)
+    if fmt == "asym_w4a8_int8":
+        # W4A8 carries several scale tensors, not one. ComfyUI's load path reads exactly
+        # these names (weight_s_rel / weight_s_channel / weight_codebook). A correction
+        # tensor has no load path and symmetric quantization never produces one, so refuse
+        # rather than drop it silently and ship a checkpoint missing part of its own scale.
+        if getattr(params, "correction", None) is not None:
+            raise RuntimeError(
+                "asym_w4a8_int8 produced a correction tensor, which the checkpoint format "
+                "cannot store")
+        scales = {"weight_s_rel": params.scale, "weight_s_channel": params.s_channel}
+        if getattr(params, "codebook", None) is not None:
+            scales["weight_codebook"] = params.codebook
+        return qdata, scales, conf
     return qdata, {"weight_scale": params.scale}, conf
 
 
@@ -721,7 +741,9 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
             if key.endswith(".weight"):
                 layer = key[: -len(".weight")]
                 if is_target(layer, prefix, suffixes):
-                    for suffix in ("weight_scale", "weight_scale_2", "input_scale", "comfy_quant"):
+                    for suffix in ("weight_scale", "weight_scale_2", "input_scale",
+                                   "weight_s_rel", "weight_s_channel", "weight_codebook",
+                                   "weight_correction", "comfy_quant"):
                         stale_companions.add("{}.{}".format(layer, suffix))
 
         for i, key in enumerate(keys):
@@ -874,9 +896,16 @@ def convert(src: str, dst: str, fmt: str, groupsize: int, device: str = "cuda", 
 _FORMAT_ALIASES = {
     "int8": "int8_tensorwise",
     "w4a4": "convrot_w4a4",
+    "w4a8": "asym_w4a8_int8",
     "svdq": "convrot_w4a4",
+    "svdq8": "asym_w4a8_int8",
     "fp8": "float8_e4m3fn",
 }
+
+# Which format names carry a low-rank branch. Keyed rather than compared against "svdq" in
+# five places, because that comparison is exactly what silently dropped the rank when the
+# second branched format arrived.
+_BRANCHED_FORMATS = ("svdq", "svdq8")
 
 _GENERIC_STEMS = ("raw", "model", "diffusion_pytorch_model", "turbo")
 
@@ -899,13 +928,16 @@ def resolve_format(fmt_name: str, rank: int, rank_was_set: bool = True) -> tuple
         raise RuntimeError("{} is not available in this ComfyUI build".format(fmt))
     # Silently zeroing the rank here used to make `--format w4a4 --rank 128` look like it had
     # done something it had not.
-    if fmt_name != "svdq" and rank_was_set:
+    if fmt_name not in _BRANCHED_FORMATS and rank_was_set:
         raise RuntimeError(
-            "rank only applies to format 'svdq' (you asked for '{}'). The low-rank branch is "
-            "what distinguishes svdq from plain w4a4.".format(fmt_name))
-    if fmt_name == "svdq" and rank <= 0:
-        raise RuntimeError("format 'svdq' needs rank > 0; use format 'w4a4' for no branch")
-    return fmt, (rank if fmt_name == "svdq" else 0)
+            "rank only applies to {} (you asked for '{}'). The low-rank branch is what "
+            "distinguishes svdq from plain w4a4, and svdq8 from plain w4a8.".format(
+                " and ".join(repr(f) for f in _BRANCHED_FORMATS), fmt_name))
+    if fmt_name in _BRANCHED_FORMATS and rank <= 0:
+        plain = {"svdq": "w4a4", "svdq8": "w4a8"}[fmt_name]
+        raise RuntimeError("format {!r} needs rank > 0; use format {!r} for no branch"
+                           .format(fmt_name, plain))
+    return fmt, (rank if fmt_name in _BRANCHED_FORMATS else 0)
 
 
 def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
@@ -934,7 +966,7 @@ def derive_out_path(src: str, fmt_name: str, rank: int, variant: str,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("src")
-    ap.add_argument("--format", choices=["int8", "w4a4", "svdq", "fp8"], default="int8",
+    ap.add_argument("--format", choices=["int8", "w4a4", "w4a8", "svdq", "svdq8", "fp8"], default="int8",
                     help="svdq = w4a4 residual + SVDQuant low-rank bf16 branch; "
                          "fp8 = float8_e4m3fn, no convrot, no low-rank branch")
     ap.add_argument("--groupsize", type=int, default=256, help="unused for fp8")

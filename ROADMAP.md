@@ -142,6 +142,44 @@ one cell -- one prompt, one seed pair, five frames -- which is the methodology
 An earlier comparison against the published plain-int4 H3 was discarded rather than
 reported: that file is broken, and a number against a broken baseline is worse than none.
 
+### Act-aware rescues it — the earlier pessimism was measured wrong
+
+Everything above was built without activation statistics. With them, at rank 256, the same
+graph, seed, prompt and reference:
+
+| arm | LPIPS ↓ | PSNR | SSIM |
+|---|---|---|---|
+| noise floor — two bf16 runs, different seeds | 0.5845 | 12.27 dB | 0.3669 |
+| svdq rank 64, no act-aware | 0.5645 | 13.57 dB | 0.4573 |
+| w4a4 noLowRank | 0.5964 | 13.57 dB | 0.4729 |
+| **svdq rank 256, act-aware** | **0.3071** | **17.03 dB** | **0.6504** |
+
+LPIPS 0.5645 → 0.3071 is eight times the difference the branch made on its own, and it puts
+the checkpoint well *below* the noise floor — meaningfully closer to bf16 than two bf16 runs
+are to each other.
+
+**Why the earlier reading was wrong, and it is worth writing down.** A rank sweep on single
+layers said rank was a dead lever: reconstruction error only fell 16.05% → 12.13% from rank
+64 to 256, and rank 1024 was needed just to reach what W4A8 gets with no branch. That sweep
+measured **plain Frobenius error**, which act-aware does not change — it changes *where the
+rank is spent*. The quantity that moved is not the one that was being measured. Two separate
+conclusions in this entry have now been reversed by measuring a better-chosen quantity; the
+lesson is the same both times.
+
+Two things this does not yet separate: rank 64 → 256 and act-aware off → on were changed
+together, so the attribution is unknown, and it matters practically (rank 64 is 0.56 GB of
+branch against 2.22 GB). And it is still one prompt, one seed pair, five frames.
+
+### Dead ends, measured
+
+* **`quant_group_size`.** Not a knob: `int4 MMA kernel requires quant_group_size 64`. The
+  weight side of `convrot_w4a4` cannot be made finer.
+* **Rank alone.** See above — without act-aware it buys very little.
+* **W4A8 (`asym_w4a8_int8`)** is now supported (`--format w4a8` / `svdq8`) and does cut
+  weight error hard: 7.31% against convrot_w4a4's 16.05% on the same H3 layer. But it keeps
+  activations at 8 bits, which gives up the reason to run W4A4 at all — the 4-bit activation
+  path is the one that beats bf16 tensor-core speed. Kept as a format, not the recommendation.
+
 ### What would actually settle it
 
 * **Audio.** Still the real complaint and still unmeasured: H3 generates audio in the same
