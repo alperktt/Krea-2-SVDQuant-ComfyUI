@@ -80,183 +80,31 @@ LPIPS against a BF16 reference, so this is a run, not new machinery. Until that 
 honest statement is the one in TROUBLESHOOTING.md: the default changed, the output changed,
 and the new one is at least reproducible.
 
-## 1c. MiniMax H3 (issue #5): quantizes, loads and renders — quality unmeasured
+## 1c. MiniMax H3 (issue #5) — tried, closed, negative
 
-**Status: the mechanism works end to end; the reason to want it is still unproven.**
+**Status: closed. The mechanism works on H3; the output does not justify it.**
 
-`quantize_krea2.py` only ever knew one Krea 2 thing: which leaf names under `blocks.N.` are
-worth quantizing, as a module-level tuple five functions closed over. That is now
-`ARCHITECTURES`, detected from the checkpoint by `detect_architecture()`. Krea 2 is eight
-leaves over 28 blocks; MiniMax H3 is four over 50 (`attn.qkv_proj`, `attn.out_proj`,
-`mlp.fc1`, `mlp.fc2` — Q/K/V arrive fused, which is also why `--rank-alloc gqa` is refused
-there: it is defined over `attn.wk`/`attn.wv`, which H3 does not have as separate tensors).
-This is the same generalization item 7 needs for the text encoder.
+Rendered as actual work — 15.08 s, 832×480, five shots, two speakers, a structured prompt,
+8-step turbo LoRA, seed held — `int8_convrot` is clearly better to look at than a rank-256
+act-aware W4A4 build, finishes in the same time (525 s against 530 s), and costs only 7 GB
+more. The 4-bit activation path's speed advantage did not appear at this size.
 
-Measured, from `Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16`
-(40.2 GB, already in ComfyUI's own layout, so no key conversion is needed at all):
+Measured along the way and not worth repeating: `quant_group_size` is fixed at 64 by the
+int4 MMA kernel; rank alone decays far too slowly (rank 1024 barely reaches what W4A8 gets
+with no branch); act-aware is the largest lever and still not enough. The audio complaint
+that motivated the attempt turned out to be the prompt schema and the `fl2v` turbo LoRA,
+not quantization — bf16 with the same LoRA is quieter than the 4-bit build.
 
-| | |
-|---|---|
-| build | 200/200 layers, rank 64, refine 100, **11.11 GB from 37.46 GB, 185 s** |
-| load | `MiniMaxH3Model`, 200/200 branches attached, `ModelPatcherDynamic` |
-| kernel | `cuda (comfy_kitchen.backends.cuda.convrot_w4a4_linear)` |
-| render | 640×352, 5 frames, 20 steps, no turbo LoRA — coherent frames |
+Four metrics in a row failed to predict the thing they stood in for (PSNR/SSIM, plain
+Frobenius error, then LPIPS — each measured on five frames of one prompt at a resolution
+nobody would ship). That is the transferable lesson.
 
-Branch cost on H3, computed from the real shapes: rank 64 is 0.56 GiB over a 8.97 GiB
-4-bit body (6%), rank 256 is 2.22 GiB (25%) — the same proportion Krea 2 pays.
+Full history, numbers and code: tag **`experiment/minimax-h3-w4a4`**. Known flaw if anyone
+retries: the activation statistics were captured at a different resolution, LoRA and prompt
+style than the render they were used for.
 
-The kernel was never the risk: a plain `convrot_w4a4` H3 already exists publicly and carries
-exactly the config `--format w4a4` writes here (`{"format": "convrot_w4a4",
-"convrot_groupsize": 256}`, 1-D scales). What it does not carry is a low-rank branch.
-
-### The branch does not pay for itself here — measured, one cell
-
-The reason to want SVDQuant on H3 was that plain 4-bit reportedly costs quality, and the
-low-rank branch is the mechanism that absorbs quantization residual. On the picture, at
-rank 64, that did not reproduce.
-
-Against the 40 GB bf16 source, 4-step turbo LoRA, 640×352, 5 frames, one prompt, one seed,
-mean over frames:
-
-| | LPIPS ↓ | PSNR | SSIM | size |
-|---|---|---|---|---|
-| **noise floor** — two bf16 runs, different seeds | 0.5844 | 12.27 dB | 0.3669 | — |
-| svdq rank 64 (branch) | **0.5645** | 13.57 dB | 0.4573 | 11.11 GB |
-| w4a4 noLowRank (no branch) | 0.5963 | 13.57 dB | 0.4729 | 10.56 GB |
-
-**On LPIPS the branch is worth 0.032**, and it is the difference between landing just inside
-the noise floor and just outside it. PSNR and SSIM cannot see this at all — they score the
-two arms identically to two decimal places, and SSIM ranks the branchless one *ahead*.
-
-That disagreement is the finding, and it is a correction: an earlier revision of this entry
-read "the branch buys 0.00 dB and costs 0.55 GB", concluded from PSNR/SSIM alone. This repo
-already argues against exactly that mistake -- `fidelity_bench.py` scores on LPIPS for a
-reason -- and the claim was made anyway. It is withdrawn.
-
-What survives is smaller and less comfortable. All three arms sit around LPIPS 0.58 against
-the reference, so **4-bit H3 is a long way from bf16 whatever the branch does**; 0.032 is a
-small margin next to a 0.58 floor. The branch helps and does not rescue. And this is still
-one cell -- one prompt, one seed pair, five frames -- which is the methodology
-`tools/fidelity_bench.py` exists to avoid.
-
-An earlier comparison against the published plain-int4 H3 was discarded rather than
-reported: that file is broken, and a number against a broken baseline is worse than none.
-
-### Act-aware rescues it — the earlier pessimism was measured wrong
-
-Everything above was built without activation statistics. With them, at rank 256, the same
-graph, seed, prompt and reference:
-
-| arm | LPIPS ↓ | PSNR | SSIM |
-|---|---|---|---|
-| noise floor — two bf16 runs, different seeds | 0.5845 | 12.27 dB | 0.3669 |
-| svdq rank 64, no act-aware | 0.5645 | 13.57 dB | 0.4573 |
-| w4a4 noLowRank | 0.5964 | 13.57 dB | 0.4729 |
-| **svdq rank 256, act-aware** | **0.3071** | **17.03 dB** | **0.6504** |
-
-LPIPS 0.5645 → 0.3071 is eight times the difference the branch made on its own, and it puts
-the checkpoint well *below* the noise floor — meaningfully closer to bf16 than two bf16 runs
-are to each other.
-
-**Why the earlier reading was wrong, and it is worth writing down.** A rank sweep on single
-layers said rank was a dead lever: reconstruction error only fell 16.05% → 12.13% from rank
-64 to 256, and rank 1024 was needed just to reach what W4A8 gets with no branch. That sweep
-measured **plain Frobenius error**, which act-aware does not change — it changes *where the
-rank is spent*. The quantity that moved is not the one that was being measured. Two separate
-conclusions in this entry have now been reversed by measuring a better-chosen quantity; the
-lesson is the same both times.
-
-Separating the two, at fixed rank and fixed everything else:
-
-| arm | LPIPS ↓ | PSNR | SSIM | size |
-|---|---|---|---|---|
-| rank 64, no act-aware | 0.5645 | 13.57 dB | 0.4573 | 11.11 GB |
-| rank 64, **act-aware** | 0.4213 | 15.16 dB | 0.5677 | 11.11 GB |
-| rank 128, act-aware | 0.5169 | 14.91 dB | 0.5480 | 11.67 GB |
-| rank 256, act-aware | **0.3071** | **17.03 dB** | **0.6504** | 12.78 GB |
-
-Act-aware at fixed rank 64 is worth 0.143 of the 0.257 total; rank 64 → 256 on top of it is
-worth the other 0.114. **Neither alone is enough** — plain rank was already measured as
-nearly dead, and act-aware at rank 64 still sits well short of rank 256.
-
-Rank 128 scoring *worse* than rank 64 is the useful part of the table: it breaks the
-ordering the other three rows imply, which is what a single cell looks like when the
-sampling trajectory is chaotic. Treat individual ~0.1 LPIPS gaps here as unresolved. What
-survives the noise is the size of the act-aware effect and rank 256 being clear of
-everything else.
-
-### The verdict from a real clip: INT8 wins, and W4A4 is not worth it here
-
-Everything above was scored on five frames at 640x352 from one prompt. Rendered as an actual
-piece of work -- 15.08 s, 832x480, five shots, two speakers, a 3.6 KB structured prompt, the
-8-step turbo LoRA, seed held -- against `int8_convrot` on the identical graph:
-
-| | W4A4 svdq r256 act-aware | INT8 convrot |
-|---|---|---|
-| size | 13.72 GB | 20.97 GB |
-| render | 530 s | 525 s |
-| picture | **clearly worse** | **clearly better** |
-
-The picture judgement is a human one and it was not close. It also went the opposite way to
-the LPIPS number, which had W4A4 sitting well inside the noise floor against bf16.
-
-**And the speed advantage did not appear.** 530 s against 525 s, on a model whose entire
-reason to exist is that 4-bit activations run faster than the 8-bit path. The likely reason
-is that 21 GB of INT8 plus a 362-frame latent does not fit in 24 GB and streams, paying back
-exactly what the kernel wins — so the comparison would probably separate on a smaller render.
-Not measured, not claimed.
-
-So on this hardware, for this model: **INT8 costs 7 GB more, renders in the same time, and
-looks better.** W4A4 is a working mechanism looking for a model that needs it, and H3 is not
-that model.
-
-**One flaw worth naming before anyone repeats this.** The activation statistics were captured
-at 640x352, with the *4-step* LoRA, from five short prose prompts. The film ran at 832x480
-with the 8-step LoRA and a long structured prompt. Activation distributions depend on
-resolution and prompt, so the branch was calibrated against conditions it was never asked to
-run in. Recapturing at the real inference settings is the one untried thing that could move
-this, and it is not obviously worth the GPU time given the size of the gap.
-
-### Dead ends, measured
-
-* **`quant_group_size`.** Not a knob: `int4 MMA kernel requires quant_group_size 64`. The
-  weight side of `convrot_w4a4` cannot be made finer.
-* **Rank alone.** See above — without act-aware it buys very little.
-* **W4A8 (`asym_w4a8_int8`)** is now supported (`--format w4a8` / `svdq8`) and does cut
-  weight error hard: 7.31% against convrot_w4a4's 16.05% on the same H3 layer. But it keeps
-  activations at 8 bits, which gives up the reason to run W4A4 at all — the 4-bit activation
-  path is the one that beats bf16 tensor-core speed. Kept as a format, not the recommendation.
-
-### What would actually settle it
-
-* **Audio — answered, and it is not this repo's problem.** H3 generates audio in the same
-  forward pass, and "4-bit costs audible quality" was the reason to attempt any of this. It
-  does not hold. Same prompt, seed and graph at 832×480×124: the 40 GB **bf16** with the
-  turbo LoRA produces *quieter* audio than the 4-bit build with the same LoRA (RMS −25.9 vs
-  −22.2 dBFS). Quantization is exonerated.
-
-  Two other things were: the prompt, and the LoRA. H3 wants a three-field training caption,
-  and leaving `overall_soundscape` blank produces weak audio on any checkpoint — plain prose
-  produced it on every arm here and looked exactly like a quantization fault. And the turbo
-  LoRAs are `fl2v` (video) against an `fl2va` model: zero audio-specific tensors in them, but
-  audio and video tokens share the same block linears, so a video-only distillation flattens
-  the sound anyway. Dropping the LoRA and sampling 30 steps measures −16.8 dBFS, 5.4 dB above
-  either LoRA arm. Turbo speed and good audio are not currently available together.
-
-  What is still true: there is no audio *fidelity* metric here, so "does the branch help the
-  audio" remains unanswerable. But the premise that sent us looking is gone.
-* **Act-aware calibration.** On Krea 2 this was the large fidelity win (LPIPS 0.3378 →
-  0.2825), much larger than rank. No statistics have been captured for H3.
-  `svdquant_capture` now matches the union of every architecture's leaves, so it will hook
-  H3's layers; nobody has run it.
-* **A real bench.** Multiple prompts and seeds, paired, the way Test 3 was run.
-* **`ref2va`.** Untouched. It and `fl2va` fail closed, so it needs its own build.
-
-So: "H3 can be SVDQuantized" is measured and true. "H3 *should* be" currently has one
-measurement pointing at no, on the half of the model that was never the complaint. Until
-that is resolved, this stays a roadmap entry and **no H3 checkpoint is published or listed
-in the README** — the branchless `--format w4a4` build is the one that looks worth having,
-and it needs no code from this repo to load.
+What survives in `master` is the architecture registry (`ARCHITECTURES`,
+`detect_architecture`), because item 7 needs the same generalization for the text encoder.
 
 ## 2. Act-aware at ranks other than 256
 
